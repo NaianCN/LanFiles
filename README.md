@@ -4,8 +4,8 @@
 >
 > A single-file, zero-dependency LAN file transfer tool. Run it on one computer, and any device (phone / tablet / PC) on the same network opens the address in a browser to transfer files — **nothing to install**.
 
-纯 Python 标准库实现，跨平台（macOS / Windows / Linux），iOS 风格界面。
-Pure Python standard library, cross-platform (macOS / Windows / Linux), iOS-style UI.
+纯 Python 标准库实现，跨平台（macOS / Windows ），iOS 风格界面。
+Pure Python standard library, cross-platform (macOS / Windows ), iOS-style UI.
 
 ---
 
