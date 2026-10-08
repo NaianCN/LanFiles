@@ -1,0 +1,65 @@
+#!/bin/bash
+# LanFiles 启动引导：严格选择具备现代图形渲染 (Tk >= 8.6 / 9.0) 的 Python 3 解释器
+
+check_python() {
+    local bin="$1"
+    if [ -x "$bin" ]; then
+        if "$bin" -c "import tkinter as tk; exit(0 if tk.TkVersion >= 8.6 else 1)" 2>/dev/null; then
+            echo "$bin"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+PYTHON_BIN=""
+
+# 1. 优先检查官方 Python.framework (3.14, 3.13, 3.12, 3.11, Current)
+for p in \
+    "/Library/Frameworks/Python.framework/Versions/3.14/bin/python3" \
+    "/Library/Frameworks/Python.framework/Versions/3.13/bin/python3" \
+    "/Library/Frameworks/Python.framework/Versions/3.12/bin/python3" \
+    "/Library/Frameworks/Python.framework/Versions/3.11/bin/python3" \
+    "/Library/Frameworks/Python.framework/Versions/Current/bin/python3"; do
+    if [ -x "$p" ]; then
+        FOUND="$(check_python "$p")"
+        if [ -n "$FOUND" ]; then
+            PYTHON_BIN="$FOUND"
+            break
+        fi
+    fi
+done
+
+# 2. 检查 Homebrew 与常见本地安装路径
+if [ -z "$PYTHON_BIN" ]; then
+    for p in \
+        "/opt/homebrew/bin/python3" \
+        "/usr/local/bin/python3"; do
+        if [ -x "$p" ]; then
+            FOUND="$(check_python "$p")"
+            if [ -n "$FOUND" ]; then
+                PYTHON_BIN="$FOUND"
+                break
+            fi
+        fi
+    done
+fi
+
+# 3. 检查系统 PATH 中的 python3 (同样严格过滤，拒绝已被系统弃用且无法渲染文字的 Tk 8.5)
+if [ -z "$PYTHON_BIN" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+        FOUND="$(check_python "$(command -v python3)")"
+        if [ -n "$FOUND" ]; then
+            PYTHON_BIN="$FOUND"
+        fi
+    fi
+fi
+
+if [ -z "$PYTHON_BIN" ]; then
+    osascript -e 'display alert "未检测到支持现代界面的 Python 3" message "macOS 自带的 Python 3.9 (Tk 8.5) 已被系统废弃且无法正常渲染文字。请安装官方 Python 3.11+ 或通过 Homebrew 安装 Python。"'
+    exit 1
+fi
+
+APP_DIR="$(cd "$(dirname "$0")/../Resources" && pwd)"
+export TK_SILENCE_DEPRECATION=1
+exec "$PYTHON_BIN" "$APP_DIR/app.py" "$@"

@@ -1,0 +1,17 @@
+{
+  "results": [
+    "Single deletion confirmation can be cancelled without deleting data",
+    "Single deletion removes both file listing and persisted transfer",
+    "Only sender can delete broadcast, including after leaving its room",
+    "Cross-group batch confirms once, serializes requests, survives polling and keeps new arrivals",
+    "Partial failure is visible and retained for an explicit retry",
+    "Already removed transfer is treated as complete",
+    "401 stops remaining deletions without retrying them",
+    "Identity recovery clears file selection",
+    "Pending delete survives restart, disables actions and disappears after successful retry",
+    "Late old-session response does not overwrite new identity or selection",
+    "Cookie identity change stops batch before submitting remaining old-identity items",
+    "Deletion controls render on mobile/desktop without overflow or script errors"
+  ],
+  "errors": []
+}

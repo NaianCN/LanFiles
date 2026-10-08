@@ -1,0 +1,16 @@
+{
+  "results": [
+    "HttpOnly Cookie identity unavailable to page JavaScript",
+    "Uploads queued serially and queued recipient remains fixed",
+    "Browser download includes Cookie and preserves Chinese name/content",
+    "Connection loss visibly reported",
+    "Service restart restores same identity and outstanding inbox without reload",
+    "Tabs share one persisted browser identity",
+    "Pending uploads pause until identity recovery; failed item is not retried",
+    "Polling does not overwrite an actively edited room code",
+    "Room broadcast remains available to current members",
+    "Lost credential creates new identity and clears stale private inbox",
+    "Desktop/mobile render without horizontal overflow or JavaScript errors"
+  ],
+  "errors": []
+}

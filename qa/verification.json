@@ -1,0 +1,21 @@
+{
+  "version": "1.2.0",
+  "backend_test_command": "PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -v",
+  "backend_tests": 43,
+  "browser_checks": 11,
+  "delete_browser_checks": 12,
+  "gui_smoke_verified": true,
+  "windows_runtime_verified": false,
+  "source_hashes": {
+    "transfer.py": "1199c3b1b7653c1b79ed3568f217dc5036cedce143f03f2df1d70f88a7cf39d0",
+    "app.py": "9c49caef23b04391d0ca1c267e1e73cee4cb7f221717bfd4ba864e1e62a2e71d",
+    "test_transfer.py": "07caa7ce1e4bdcd4761cb8d9c4892111d2b5df0532746229a06ba698eca3d34a",
+    "qr_core.py": "3b42147852214a999b23961109cfc4440f232b92338b4a3cfae28f0a942bda2d",
+    "build_app.sh": "850b64f33a8935423f13dd7744987befe908b204e1c283e25411533a0a0d5024",
+    "README.md": "d44b2895da4dc2ac1c76b4a194520c13676339d70906af42ac02ed3a60e2a969"
+  },
+  "package_hashes": {
+    "lanfiles-win.zip": "c8da93ef34c2bfc4f4b750cd22fba726b67994d8cb45b493b1d2eecb2f78e353",
+    "lanfiles-macos.zip": "3f1a24486c59050c5ee7f744d6314562320691da611667ed1888db9ab30cc840"
+  }
+}
