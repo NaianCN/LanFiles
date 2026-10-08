@@ -2,7 +2,7 @@
 
 当前版本：**1.2.0** · 作者：**GPT、Gemini** · 项目维护：**NaianCN**
 
-[Windows 免安装包](lanfiles-win.zip) · [macOS 应用包](lanfiles-macos.zip) · [更新记录](CHANGELOG.md)
+[Windows 免安装包](https://raw.githubusercontent.com/NaianCN/LanFiles/770db0b969509cfa0a6b0a0389051ed1ca155d2b/lanfiles-win.zip) · [macOS 应用包](https://raw.githubusercontent.com/NaianCN/LanFiles/770db0b969509cfa0a6b0a0389051ed1ca155d2b/lanfiles-macos.zip) · [更新记录](CHANGELOG.md)
 
 Python 标准库实现的局域网文件互传工具。电脑启动服务后，其他设备用浏览器打开地址，即可私发文件或在同一房间内共享。支持 macOS、Windows、Linux，不需要安装第三方 Python 包。
 
