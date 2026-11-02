@@ -15,7 +15,10 @@
 """
 
 import argparse
+import base64
 import hashlib
+import hmac
+import ipaddress
 import secrets
 import signal
 import sqlite3
@@ -86,6 +89,10 @@ def ensure_spool_dir(target):
 # 持久化登记、身份、资源限制
 # ---------------------------------------------------------------------------
 SESSION_TTL = 7 * 24 * 3600
+AUTH_NONCE_TTL = 120.0         # 登录随机数有效期（秒）
+AUTH_FAILURE_WINDOW = 300.0    # 密码错误计数窗口（秒）
+AUTH_FAILURES_PER_IP = 5
+AUTH_FAILURES_GLOBAL = 50
 NAME_MEMORY_TTL = 30 * 24 * 3600  # 按来源 IP 记住的名字保留多久
 COOKIE_NAME = "lanfiles_session"
 ID_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -154,10 +161,23 @@ class Store:
                     self._instance.write(b"\0")
                     self._instance.flush()
                 self._instance.seek(0)
-                msvcrt.locking(self._instance.fileno(), msvcrt.LK_NBLCK, 1)
+                try:
+                    msvcrt.locking(self._instance.fileno(), msvcrt.LK_NBLCK, 1)
+                except OSError:
+                    raise RuntimeError(self._busy_message(None)) from None
             else:
                 import fcntl
-                fcntl.flock(self._instance.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    fcntl.flock(self._instance.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    self._instance.seek(0)
+                    holder = self._instance.read(16).decode("ascii", "replace").strip()
+                    raise RuntimeError(self._busy_message(holder if holder.isdigit() else None)) from None
+                # 记下持锁进程号，下一个实例启动失败时可以告诉用户是谁占用了目录。
+                self._instance.seek(0)
+                self._instance.truncate()
+                self._instance.write(str(os.getpid()).encode("ascii"))
+                self._instance.flush()
             db_path = os.path.join(self.state_dir, "state.sqlite3")
             if os.path.islink(db_path):
                 raise RuntimeError("状态数据库不能是符号链接")
@@ -195,10 +215,15 @@ class Store:
                 raise RuntimeError("状态数据库含非法实例 ID")
             # Cookie 不按端口隔离：用持久化实例 ID 隔离不同中转目录，同时支持改端口。
             self.cookie_name = COOKIE_NAME + "_" + instance_id
+            self.instance_id = instance_id
             self.recover()
         except Exception:
             self.close()
             raise
+
+    def _busy_message(self, pid):
+        return "中转目录 %s 已被另一个 LanFiles 服务占用%s。请先关闭那个服务（其他窗口或终端），或换一个目录" % (
+            self.root, "（进程 %s）" % pid if pid else "")
 
     def file_path(self, tid, partial=False):
         if not isinstance(tid, str) or not ID_RE.fullmatch(tid):
@@ -308,6 +333,21 @@ class Store:
                 self.db.execute("DELETE FROM devices WHERE id=?", (did,))
             self._seen.pop(did, None)
             return {"ok": True}
+
+    def apply_password(self, password):
+        """访问密码变化（含首次启用）时注销全部旧身份；返回被注销的数量。"""
+        tag = hmac.new(password.encode("utf-8"), self.instance_id.encode("ascii"), "sha256").hexdigest() if password else ""
+        with self._lock:
+            self.cleanup()  # 先回收过期身份，下面只处理有效身份
+            row = self.db.execute("SELECT value FROM settings WHERE key='password_tag'").fetchone()
+            removed = 0
+            if tag and (row is None or row[0] != tag):
+                for (did,) in list(self.db.execute("SELECT id FROM devices")):
+                    self.delete_device(did)
+                    removed += 1
+            with self.db:
+                self.db.execute("INSERT OR REPLACE INTO settings VALUES ('password_tag',?)", (tag,))
+            return removed
 
     def _used(self):
         return self.db.execute("SELECT COALESCE(SUM(CASE WHEN state='uploading' THEN expected ELSE size END),0) FROM transfers").fetchone()[0]
@@ -551,6 +591,14 @@ def log_transfer(action, filename, size, who, seconds):
         time.strftime("%H:%M:%S"), action, filename, mb, who, seconds, speed), flush=True)
 
 
+def _is_ip(value):
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return False
+
+
 def random_name():
     return "%s%s" % (secrets.choice(ADJECTIVES), secrets.choice(NOUNS))
 
@@ -565,8 +613,14 @@ class LanFilesServer(ThreadingHTTPServer):
     daemon_threads = False
     block_on_close = True
 
-    def __init__(self, address, store):
+    def __init__(self, address, store, password=None, allow_hosts=()):
         self.store = store
+        self.password = password or None
+        # 只接受 IP 字面量、localhost 和 --allow-host 指定的名字作为 Host，防止 DNS 重绑定。
+        self.allowed_names = {"localhost"} | {h.strip().lower() for h in allow_hosts if h.strip()}
+        self._auth_lock = threading.Lock()
+        self._nonces = {}
+        self._auth_failures = deque()
         self.stop_event = threading.Event()
         self._permits = threading.BoundedSemaphore(store.limits.max_connections)
         self._connections = set()
@@ -579,8 +633,57 @@ class LanFilesServer(ThreadingHTTPServer):
         except Exception:
             store.close()
             raise
+        removed = store.apply_password(self.password)
+        if removed:
+            print("访问密码已变更，已注销 %d 个旧设备身份" % removed, flush=True)
         self._cleanup_thread = threading.Thread(target=self._cleanup, daemon=True)
         self._cleanup_thread.start()
+
+    def host_allowed(self, host):
+        if host.startswith("["):
+            name = host[1:host.find("]")] if "]" in host else ""
+        else:
+            name = host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+        name = name.lower().rstrip(".")
+        return bool(name) and (_is_ip(name) or name in self.allowed_names)
+
+    def issue_challenge(self):
+        with self._auth_lock:
+            now = time.monotonic()
+            for nonce in [n for n, exp in self._nonces.items() if exp <= now]:
+                del self._nonces[nonce]
+            while len(self._nonces) >= 256:
+                del self._nonces[next(iter(self._nonces))]
+            nonce = secrets.token_hex(16)
+            self._nonces[nonce] = now + AUTH_NONCE_TTL
+            return nonce
+
+    def verify_access(self, auth, addr):
+        """挑战应答：浏览器只发送 HMAC(密码, 一次性随机数)，密码本身不经过网络。"""
+        with self._auth_lock:
+            now = time.monotonic()
+            while self._auth_failures and self._auth_failures[0][0] <= now - AUTH_FAILURE_WINDOW:
+                self._auth_failures.popleft()
+            if len(self._auth_failures) >= AUTH_FAILURES_GLOBAL or sum(
+                    ip == addr for _, ip in self._auth_failures) >= AUTH_FAILURES_PER_IP:
+                raise APIError(429, "密码错误次数过多，请 5 分钟后再试")
+            if auth is None:
+                raise APIError(401, "需要访问密码", "password_required")
+            if not isinstance(auth, dict) or set(auth) != {"nonce", "proof"} or not all(
+                    isinstance(v, str) and len(v) <= 128 for v in auth.values()):
+                raise APIError(400, "密码验证格式无效")
+            expires = self._nonces.pop(auth["nonce"], None)
+            expected = hmac.new(self.password.encode("utf-8"), auth["nonce"].encode("ascii", "replace"),
+                                "sha256").hexdigest()
+            if expires is None or expires <= now or not hmac.compare_digest(expected, auth["proof"].lower()):
+                self._auth_failures.append((now, addr))
+                raise APIError(401, "访问密码错误", "bad_password")
+
+    def handle_error(self, request, client_address):
+        # 客户端断开等属于正常网络噪声，不打印堆栈。
+        if isinstance(sys.exc_info()[1], OSError):
+            return
+        super().handle_error(request, client_address)
 
     def _cleanup(self):
         while not self.stop_event.wait(CLEANUP_INTERVAL):
@@ -637,8 +740,8 @@ class LanFilesServer(ThreadingHTTPServer):
         self.store.close()
 
 
-def create_server(host, port, spool_dir, limits=None):
-    return LanFilesServer((host, port), Store(spool_dir, limits))
+def create_server(host, port, spool_dir, limits=None, password=None, allow_hosts=()):
+    return LanFilesServer((host, port), Store(spool_dir, limits), password, allow_hosts)
 
 
 def parse_size(value):
@@ -673,9 +776,18 @@ class Handler(BaseHTTPRequestHandler):
     server_version = "LanFiles/2.0"
     protocol_version = "HTTP/1.1"
 
+    body_consumed = False
+
     @property
     def store(self):
         return self.server.store
+
+    def _security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Cross-Origin-Opener-Policy", "same-origin")
+        self.send_header("Cross-Origin-Resource-Policy", "same-origin")
 
     def _send(self, status, body, content_type="text/plain; charset=utf-8", extra=None):
         if isinstance(body, str):
@@ -686,8 +798,7 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("Connection", "close")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
+        self._security_headers()
         for key, value in (extra or {}).items():
             self.send_header(key, value)
         self.end_headers()
@@ -740,10 +851,29 @@ class Handler(BaseHTTPRequestHandler):
     def _origin(self):
         origin = self.headers.get_all("Origin", [])
         hosts = self.headers.get_all("Host", [])
-        if len(hosts) != 1:
-            raise APIError(400, "需要唯一 Host 请求头")
         if origin and (len(origin) != 1 or origin[0] != "http://" + hosts[0]):
             raise APIError(403, "拒绝跨站修改请求")
+
+    def _drain_body(self):
+        """拒绝请求前读掉不大的请求体，否则关闭连接会重置 TCP，客户端看不到错误原因。"""
+        if self.body_consumed:
+            return
+        self.body_consumed = True
+        try:
+            remaining = self._length()
+        except APIError:
+            return
+        if remaining > 1024 * 1024:
+            return
+        try:
+            self.connection.settimeout(2)
+            while remaining > 0:
+                chunk = self.rfile.read1(min(remaining, 65536))
+                if not chunk:
+                    break
+                remaining -= len(chunk)
+        except OSError:
+            pass
 
     def handle_expect_100(self):
         # 不先答应接收未经校验的文件；客户端可以直接发送或等待最终响应。
@@ -754,12 +884,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             path, qs = self._query()
             self._length()  # 所有路由都拒绝有歧义的 HTTP framing。
+            hosts = self.headers.get_all("Host", [])
+            if len(hosts) != 1:
+                raise APIError(400, "需要唯一 Host 请求头")
+            if not self.server.host_allowed(hosts[0]):
+                raise APIError(400, "不接受的访问地址，请用 IP 访问")
             if method == "POST":
                 self._origin()
             if method == "GET" and path == "/":
-                return self._send(200, INDEX_HTML, "text/html; charset=utf-8")
+                return self._send(200, INDEX_HTML, "text/html; charset=utf-8", {"Content-Security-Policy": INDEX_CSP})
             if method == "GET" and path == "/favicon.ico":
                 return self._send(204, b"")
+            if method == "GET" and path == "/api/auth/challenge":
+                required = bool(self.server.password)
+                return self._json({"required": required, "nonce": self.server.issue_challenge() if required else None})
             if method == "POST" and path == "/api/register":
                 return self._api_register()
             if path.startswith("/api/admin/"):
@@ -787,6 +925,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(self.store.ack(path[len("/api/ack/"):], dev["id"]))
             self._json_error(404, "未找到该路径")
         except APIError as exc:
+            self._drain_body()
             if exc.code:
                 self._json({"error": exc.message, "code": exc.code}, exc.status)
             else:
@@ -812,6 +951,7 @@ class Handler(BaseHTTPRequestHandler):
         length = self._length()
         if length > 16 * 1024:
             raise APIError(413, "注册 JSON 不能超过 16 KiB")
+        self.body_consumed = True
         try:
             raw = self.rfile.read(length)
         except socket.timeout:
@@ -822,17 +962,20 @@ class Handler(BaseHTTPRequestHandler):
             data = json.loads(raw.decode("utf-8")) if raw else {}
         except (ValueError, UnicodeError):
             raise APIError(400, "请求体不是有效 JSON")
-        if not isinstance(data, dict) or set(data) - {"name", "domain"}:
-            raise APIError(400, "注册只接受 name 和 domain，不能指定设备 ID")
+        if not isinstance(data, dict) or set(data) - {"name", "domain", "auth"}:
+            raise APIError(400, "注册只接受 name、domain 和 auth，不能指定设备 ID")
         name, domain = data.get("name"), data.get("domain")
         if name is not None and (not isinstance(name, str) or len(name) > 80 or any(ord(c) < 32 for c in name)):
             raise APIError(400, "设备名称必须为不超过 80 字符的字符串")
         if domain is not None and (not isinstance(domain, str) or (domain and not DOMAIN_RE.fullmatch(domain))):
             raise APIError(400, "域号需为空或 4 位数字")
+        if self.server.password and not self.store.authenticate(self._token()):
+            self.server.verify_access(data.get("auth"), self.client_address[0])
         dev, token = self.store.register(self._token(), name, domain, self.client_address[0])
         extra = {}
         if token:
-            extra["Set-Cookie"] = "%s=%s; Max-Age=%d; HttpOnly; SameSite=Strict; Path=/" % (self.store.cookie_name, token, SESSION_TTL)
+            extra["Set-Cookie"] = "%s=%s; Max-Age=%d; HttpOnly; SameSite=Strict; Path=/" % (
+                self.store.cookie_name, token, SESSION_TTL)
         self._json(dict(self._profile(dev), new_identity=bool(token)), extra=extra)
 
     def _is_admin(self):
@@ -851,6 +994,7 @@ class Handler(BaseHTTPRequestHandler):
         tid = self.store.begin_upload(dev["id"], qs.get("to", [""])[0],
                                       qs.get("domain", [""])[0],
                                       sanitize_filename(qs.get("name", [""])[0]), total)
+        self.body_consumed = True  # 上传开始读取后不再兜底读取
         complete = False
         started = time.monotonic()
         deadline = started + self.store.limits.upload_timeout
@@ -902,7 +1046,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Disposition", disposition)
             self.send_header("Cache-Control", "no-store")
             self.send_header("Connection", "close")
-            self.send_header("X-Content-Type-Options", "nosniff")
+            self._security_headers()
             self.end_headers()
             started = time.monotonic()
             # sendfile 走内核零拷贝；不支持的平台（如 Windows）自动退回普通 send。
@@ -1126,10 +1270,31 @@ a.dl:active { opacity: .6; }
   .file-actions { flex-direction: column; gap: 4px; }
   .file-toolbar, .me-row, .room-row, .send-item, .sub-head { padding-left: 12px; padding-right: 12px; }
 }
+#broadcast-hint { font-size: 12px; color: var(--secondary); }
+.small-link { font-size: 13px; }
+
+/* 访问密码 */
+.login { position: fixed; inset: 0; z-index: 10; background: var(--bg); display: flex; align-items: center; justify-content: center; padding: 16px; }
+.login-card { width: 100%; max-width: 340px; background: var(--card); border-radius: 16px; box-shadow: var(--shadow); padding: 24px 20px; text-align: center; }
+.login-card .lock { font-size: 34px; }
+.login-card h2 { font-size: 18px; margin: 10px 0 16px; }
+.login-card input { width: 100%; padding: 10px 12px; font-size: 16px; border: none; border-radius: 10px; background: var(--fill); color: var(--text); outline: none; font-family: inherit; }
+.login-card input:focus { box-shadow: 0 0 0 2px var(--accent); }
+.login-card .btn { width: 100%; margin-top: 12px; padding: 10px; font-size: 15px; }
+.login-error { color: var(--red); font-size: 13px; margin-top: 10px; min-height: 18px; }
 .hidden { display: none !important; }
 </style>
 </head>
 <body>
+<div class="login hidden" id="login" role="dialog" aria-labelledby="login-title">
+  <form class="login-card" id="login-form">
+    <div class="lock">🔒</div>
+    <h2 id="login-title">输入访问密码</h2>
+    <input type="password" id="access-password" autocomplete="current-password" aria-label="访问密码">
+    <button class="btn" type="submit">进入</button>
+    <div class="login-error" id="login-error" role="alert"></div>
+  </form>
+</div>
 <div class="app">
   <header class="topbar">
     <div class="brand"><div class="logo">⇄</div><h1>局域网传文件</h1></div>
@@ -1186,7 +1351,7 @@ a.dl:active { opacity: .6; }
             <input type="file" id="file-input" multiple class="hidden">
           </div>
           <div class="send-card hidden" id="broadcast-panel">
-            <div class="send-head"><h3>发给房间内所有人</h3><span class="hint" id="broadcast-hint" style="font-size:12px;color:var(--secondary)"></span></div>
+            <div class="send-head"><h3>发给房间内所有人</h3><span class="hint" id="broadcast-hint"></span></div>
             <div class="dropzone purple" id="bdropzone">
               <div class="big">📢</div>
               <b>拖拽文件到这里，或点击选择</b>
@@ -1199,7 +1364,7 @@ a.dl:active { opacity: .6; }
       <section class="hidden" id="upload-progress">
         <div class="section-head">
           <h2>上传记录 <span class="upload-total" id="upload-total"></span></h2>
-          <button class="link-btn" id="clear-sends" style="font-size:13px">清除已完成</button>
+          <button class="link-btn small-link" id="clear-sends">清除已完成</button>
         </div>
         <div class="card">
           <ul class="sends" id="send-list"></ul>
@@ -1285,6 +1450,70 @@ a.dl:active { opacity: .6; }
     if (/^(apk|exe|msi|pkg|app)$/.test(ext)) return "📦";
     return "📄";
   }
+  // ---- 访问密码：纯 JS 的 HMAC-SHA256（HTTP 页面不能用 WebCrypto），只发送对一次性随机数的签名 ----
+  var SHA_K = [0x428a2f98,0x71374491,0xb5c0fbcf,0xe9b5dba5,0x3956c25b,0x59f111f1,0x923f82a4,0xab1c5ed5,0xd807aa98,0x12835b01,0x243185be,0x550c7dc3,0x72be5d74,0x80deb1fe,0x9bdc06a7,0xc19bf174,0xe49b69c1,0xefbe4786,0x0fc19dc6,0x240ca1cc,0x2de92c6f,0x4a7484aa,0x5cb0a9dc,0x76f988da,0x983e5152,0xa831c66d,0xb00327c8,0xbf597fc7,0xc6e00bf3,0xd5a79147,0x06ca6351,0x14292967,0x27b70a85,0x2e1b2138,0x4d2c6dfc,0x53380d13,0x650a7354,0x766a0abb,0x81c2c92e,0x92722c85,0xa2bfe8a1,0xa81a664b,0xc24b8b70,0xc76c51a3,0xd192e819,0xd6990624,0xf40e3585,0x106aa070,0x19a4c116,0x1e376c08,0x2748774c,0x34b0bcb5,0x391c0cb3,0x4ed8aa4a,0x5b9cca4f,0x682e6ff3,0x748f82ee,0x78a5636f,0x84c87814,0x8cc70208,0x90befffa,0xa4506ceb,0xbef9a3f7,0xc67178f2];
+  function sha256(bytes) {
+    var H = [0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19];
+    var len = bytes.length, total = ((len + 9 + 63) >> 6) << 6;
+    var m = new Uint8Array(total); m.set(bytes); m[len] = 0x80;
+    var dv = new DataView(m.buffer), w = new Uint32Array(64), i;
+    dv.setUint32(total - 4, (len * 8) >>> 0); dv.setUint32(total - 8, Math.floor(len / 536870912));
+    for (var o = 0; o < total; o += 64) {
+      for (i = 0; i < 16; i++) w[i] = dv.getUint32(o + i * 4);
+      for (i = 16; i < 64; i++) {
+        var x = w[i - 15], y = w[i - 2];
+        var s0 = (x >>> 7 | x << 25) ^ (x >>> 18 | x << 14) ^ (x >>> 3);
+        var s1 = (y >>> 17 | y << 15) ^ (y >>> 19 | y << 13) ^ (y >>> 10);
+        w[i] = (w[i - 16] + s0 + w[i - 7] + s1) | 0;
+      }
+      var a = H[0], b = H[1], c = H[2], d = H[3], e = H[4], f = H[5], g = H[6], h = H[7];
+      for (i = 0; i < 64; i++) {
+        var t1 = (h + ((e >>> 6 | e << 26) ^ (e >>> 11 | e << 21) ^ (e >>> 25 | e << 7)) + ((e & f) ^ (~e & g)) + SHA_K[i] + w[i]) | 0;
+        var t2 = (((a >>> 2 | a << 30) ^ (a >>> 13 | a << 19) ^ (a >>> 22 | a << 10)) + ((a & b) ^ (a & c) ^ (b & c))) | 0;
+        h = g; g = f; f = e; e = (d + t1) | 0; d = c; c = b; b = a; a = (t1 + t2) | 0;
+      }
+      H[0] = (H[0] + a) | 0; H[1] = (H[1] + b) | 0; H[2] = (H[2] + c) | 0; H[3] = (H[3] + d) | 0;
+      H[4] = (H[4] + e) | 0; H[5] = (H[5] + f) | 0; H[6] = (H[6] + g) | 0; H[7] = (H[7] + h) | 0;
+    }
+    var out = new Uint8Array(32), odv = new DataView(out.buffer);
+    for (i = 0; i < 8; i++) odv.setUint32(i * 4, H[i] >>> 0);
+    return out;
+  }
+  function hmacHex(key, message) {
+    var enc = new TextEncoder(), k = enc.encode(key), i;
+    if (k.length > 64) k = sha256(k);
+    var block = new Uint8Array(64); block.set(k);
+    var msg = enc.encode(message), inner = new Uint8Array(64 + msg.length), outer = new Uint8Array(96);
+    for (i = 0; i < 64; i++) { inner[i] = block[i] ^ 0x36; outer[i] = block[i] ^ 0x5c; }
+    inner.set(msg, 64); outer.set(sha256(inner), 64);
+    return Array.from(sha256(outer), function (v) { return (v < 16 ? "0" : "") + v.toString(16); }).join("");
+  }
+  // 扫码链接把密码放在 # 后面：不会发给服务器，读取后立即从地址栏清除。
+  var accessKey = "";
+  (function () {
+    var match = /(?:^#|&)k=([^&]*)/.exec(location.hash);
+    if (match) {
+      try { accessKey = decodeURIComponent(match[1]); } catch (_) {}
+      history.replaceState(null, "", location.pathname + location.search);
+    }
+  })();
+  var waitingForPassword = false;
+  function showLogin(message) {
+    waitingForPassword = true;
+    $("login").classList.remove("hidden");
+    $("login-error").textContent = message || "";
+    $("access-password").value = "";
+    setTimeout(function () { $("access-password").focus(); }, 0);
+  }
+  $("login-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    var value = $("access-password").value;
+    if (!value) { $("login-error").textContent = "请输入密码"; return; }
+    accessKey = value; waitingForPassword = false;
+    $("login-error").textContent = "正在验证…";
+    schedulePoll(0);
+  });
+
   function savedName() {
     try { var n = localStorage.getItem(LS_NAME) || ""; return n.length <= 80 ? n : ""; } catch (_) { return ""; }
   }
@@ -1371,9 +1600,20 @@ a.dl:active { opacity: .6; }
     var body = profile || { domain: me.domain };
     if (!profile && savedName()) body.name = savedName();
     var generation = identityGeneration;
-    registration = api("/api/register", {
-      method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
+    var send = function () {
+      return api("/api/register", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+    };
+    registration = send().catch(async function (e) {
+      if (e.code !== "password_required") throw e;
+      if (!accessKey) { showLogin(); throw e; }
+      var challenge = await api("/api/auth/challenge");
+      body.auth = { nonce: challenge.nonce, proof: hmacHex(accessKey, challenge.nonce) };
+      try { return await send(); } catch (e2) {
+        if (e2.code === "bad_password" || e2.status === 429) { accessKey = ""; showLogin(e2.message); }
+        throw e2;
+      } finally { delete body.auth; }
     }).then(function (d) {
+      $("login").classList.add("hidden");
       if (generation !== identityGeneration) return null;
       applyProfile(d);
       if (d.new_identity && (hadIdentity || identityWasLost)) showIdentityNotice();
@@ -1407,6 +1647,7 @@ a.dl:active { opacity: .6; }
     } catch (e) {
       if (requestGeneration !== identityGeneration) return schedulePoll(0);
       connected = false;
+      if (waitingForPassword) { status("需要访问密码", true); return; }  // 等用户输入后再继续
       if (e.status === 401) {
         clearStale();
         status("身份已失效，正在重新连接…", true);
@@ -1414,6 +1655,7 @@ a.dl:active { opacity: .6; }
           await register();
           status("已建立新身份；旧身份文件无法自动恢复。", true);
         } catch (registrationError) {
+          if (waitingForPassword) { status("需要访问密码", true); return; }
           status(registrationError.message + "，稍后重试", true);
         }
       } else {
@@ -1839,6 +2081,16 @@ a.dl:active { opacity: .6; }
 INDEX_HTML = INDEX_HTML.replace("__NAME_WORDS__", json.dumps([ADJECTIVES, NOUNS], ensure_ascii=False))
 
 
+def _inline_hash(tag):
+    body = re.search(r"<%s>(.*?)</%s>" % (tag, tag), INDEX_HTML, re.S).group(1)
+    return "'sha256-%s'" % base64.b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode("ascii")
+
+
+# 只允许页面自带的这一段脚本和样式；不能被嵌入其他网站的框架。
+INDEX_CSP = ("default-src 'none'; script-src %s; style-src %s; connect-src 'self'; img-src 'self'; "
+             "base-uri 'none'; form-action 'none'; frame-ancestors 'none'") % (_inline_hash("script"), _inline_hash("style"))
+
+
 # ---------------------------------------------------------------------------
 # 启动
 # ---------------------------------------------------------------------------
@@ -1929,12 +2181,20 @@ def main():
     parser.add_argument("--name", default="", help="本机显示名（默认随机）")
     parser.add_argument("--dir", default=None,
                         help="中转文件存放目录（默认 ~/Downloads/lanfiles，被系统限制时自动改用 ~/lanfiles）")
+    parser.add_argument("--password", default=None,
+                        help="访问密码（更推荐用环境变量 LANFILES_PASSWORD，避免出现在进程列表）")
+    parser.add_argument("--allow-host", action="append", default=[], metavar="名称",
+                        help="额外允许的访问域名（默认只接受 IP 和 localhost）")
+    parser.add_argument("--exit-with-parent", action="store_true", help=argparse.SUPPRESS)
     add_limit_arguments(parser)
     args = parser.parse_args()
     try:
         limits = limits_from_args(args)
     except ValueError as exc:
         parser.error(str(exc))
+    password = args.password if args.password is not None else os.environ.get("LANFILES_PASSWORD", "")
+    if len(password) > 128:
+        parser.error("访问密码不能超过 128 个字符")
 
     global SPOOL_DIR
     if args.dir is not None:
@@ -1963,7 +2223,7 @@ def main():
             print("      若想用下载文件夹，请授予访问权限后重试，或运行 python3 transfer.py --dir <目录>", flush=True)
 
     try:
-        httpd = create_server(args.host, args.port, SPOOL_DIR, limits)
+        httpd = create_server(args.host, args.port, SPOOL_DIR, limits, password, args.allow_host)
     except (OSError, sqlite3.Error, RuntimeError) as e:
         print("错误：无法启动状态存储或监听 %s:%s（%s）" % (args.host, args.port, e))
         print("提示：检查端口、中转目录实例锁及数据库；不同实例需指定不同 --dir，可用 --port 更换端口")
@@ -1987,13 +2247,26 @@ def main():
         lines.append("  备用地址：")
         for ip in others:
             lines.append("    http://%s:%d" % (ip, args.port))
+    if password:
+        lines.append("  已启用访问密码")
     lines += ["  中转目录：%s" % SPOOL_DIR,
-              "  连不上：确认同一网段、用 http://、" + fw_hint,
+              "  连不上：确认同一网段、用 http://、%s" % fw_hint,
               "=" * 60]
     print("\n".join(lines), flush=True)
     def request_stop(signum, frame):
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, request_stop)
+    if args.exit_with_parent:
+        # 桌面版被强制退出或崩溃时，服务不会留在后台继续占用端口和目录。
+        parent = os.getppid()
+
+        def watch_parent():
+            while not httpd.stop_event.wait(2):
+                if os.getppid() != parent:
+                    print("桌面程序已退出，服务随之停止。", flush=True)
+                    os.kill(os.getpid(), signal.SIGTERM)
+                    return
+        threading.Thread(target=watch_parent, daemon=True).start()
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:

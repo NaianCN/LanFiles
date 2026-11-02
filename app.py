@@ -15,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import webbrowser
 from typing import List, Tuple
@@ -183,6 +184,30 @@ def get_lan_ips() -> Tuple[str, List[str]]:
     return primary, others
 
 
+SETTINGS_PATH = os.path.expanduser("~/Library/Application Support/LanFiles/settings.json")
+
+
+def load_settings() -> dict:
+    settings = {"password": ""}
+    try:
+        with open(SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data.get("password"), str):
+            settings["password"] = data["password"][:128]
+    except (OSError, ValueError, AttributeError):
+        pass
+    return settings
+
+
+def save_settings(settings: dict):
+    """密码以明文保存在仅本人可读的设置文件（0600）中，供下次启动使用。"""
+    os.makedirs(os.path.dirname(SETTINGS_PATH), mode=0o700, exist_ok=True)
+    fd = os.open(SETTINGS_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(settings, f, ensure_ascii=False)
+    os.chmod(SETTINGS_PATH, 0o600)
+
+
 def short_path(path: str, limit: int = 42) -> str:
     """界面显示用：用户目录写成 ~，过长时只保留末尾。"""
     home = os.path.expanduser("~")
@@ -230,13 +255,14 @@ class LanFilesApp:
         self.root = root
         self.limits = limits or Limits()
         self.root.title("局域网传文件")
-        self.root.geometry("680x680")
+        self.root.geometry("680x760")
         self.root.minsize(560, 520)
         self.root.configure(bg=COLOR_BG)
 
         # 状态与配置
         self.server_port = find_available_port(8000)
         self.server_process = None
+        self.settings = load_settings()
         self.spool_dir = resolve_spool_dir()
         self.primary_ip, self.other_ips = get_lan_ips()
         self.qr_image = None
@@ -264,6 +290,8 @@ class LanFilesApp:
         # 快捷键与退出处理
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.bind("<Command-q>", lambda e: self.on_close())
+        # 程序坞或菜单栏的“退出”也要先停止服务。
+        self.root.createcommand("tk::mac::Quit", self.on_close)
         self.root.bind("<Command-w>", lambda e: self.on_close())
 
     def _find_transfer_script(self) -> str:
@@ -322,7 +350,7 @@ class LanFilesApp:
         right_body = tk.Frame(card1, bg=COLOR_CARD)
         right_body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        self.url_var = tk.StringVar(value=f"http://{self.primary_ip}:{self.server_port}")
+        self.url_var = tk.StringVar(value=self._base_url(self.primary_ip))
         self.url_display = tk.Label(right_body, textvariable=self.url_var, font=(MONO_FAMILY, 18, "bold"),
                                     fg=COLOR_BLUE, bg=COLOR_CARD, cursor="hand2", anchor="w")
         self.url_display.pack(fill=tk.X, pady=(2, 10))
@@ -400,6 +428,21 @@ class LanFilesApp:
         tk.Label(row2, textvariable=self.spool_var, font=(MONO_FAMILY, 11), bg=COLOR_CARD, fg=COLOR_SECONDARY,
                  anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8))
 
+        tk.Frame(card2, height=1, bg=COLOR_BORDER).pack(fill=tk.X, pady=6)
+        row3 = tk.Frame(card2, bg=COLOR_CARD)
+        row3.pack(fill=tk.X, pady=4)
+        tk.Label(row3, text="密码", width=4, anchor="w", font=(FONT_FAMILY, 12), bg=COLOR_CARD, fg=COLOR_TEXT).pack(side=tk.LEFT)
+        self.password_var = tk.StringVar(value=self.settings["password"])
+        self.password_entry = tk.Entry(row3, textvariable=self.password_var, show="•", width=16, font=(FONT_FAMILY, 12),
+                                       relief="flat", bg=COLOR_BG, highlightthickness=1,
+                                       highlightbackground=COLOR_BORDER, highlightcolor=COLOR_BLUE)
+        self.password_entry.pack(side=tk.LEFT, padx=(4, 8), ipady=3)
+        self.password_entry.bind("<Return>", lambda e: self.apply_password())
+        self._gray_button(row3, "应用", self.apply_password).pack(side=tk.LEFT)
+        self.password_state = tk.Label(row3, text="", font=(FONT_FAMILY, 11), bg=COLOR_CARD, fg=COLOR_SECONDARY)
+        self.password_state.pack(side=tk.LEFT, padx=(10, 0))
+        self._render_security()
+
         # 5. 日志（默认折叠） -----------------------------------------------
         log_header = tk.Frame(self.main_container, bg=COLOR_BG)
         log_header.pack(fill=tk.X, pady=(0, 6))
@@ -421,6 +464,20 @@ class LanFilesApp:
         self.log_text.config(yscrollcommand=scrollbar.set)
 
         self._update_qr()
+
+    def _base_url(self, ip):
+        return "http://%s:%d" % (ip, self.server_port)
+
+    def _share_url(self, url):
+        """二维码与复制的链接带上访问密码（在 # 之后，不会发给服务器）。"""
+        password = self.settings["password"]
+        return url + ("/#k=" + urllib.parse.quote(password, safe="") if password else "")
+
+    def _refresh_address(self):
+        self.url_var.set(self._base_url(self.primary_ip))
+        self._render_other_ips()
+        self._update_qr()
+        self._render_security()
 
     def toggle_logs(self):
         """折叠/展开日志面板。"""
@@ -458,11 +515,11 @@ class LanFilesApp:
         tk.Label(self.other_frame, text="备用", font=(FONT_FAMILY, 10), bg=COLOR_CARD,
                  fg=COLOR_SECONDARY).pack(side=tk.LEFT, padx=(0, 6))
         for ip in self.other_ips:
-            alt_url = f"http://{ip}:{self.server_port}"
+            alt_url = self._base_url(ip)
             link = tk.Label(self.other_frame, text=alt_url, font=(MONO_FAMILY, 11), bg=COLOR_CARD,
                             fg=COLOR_TEXT, cursor="hand2")
             link.pack(side=tk.LEFT, padx=(0, 10))
-            link.bind("<Button-1>", lambda e, u=alt_url, w=link: self._copy_feedback(w, u))
+            link.bind("<Button-1>", lambda e, u=self._share_url(alt_url), w=link: self._copy_feedback(w, u))
 
     # ------------------------------------------------------------------
     # 设备列表：通过本机管理接口读取与删除
@@ -550,7 +607,7 @@ class LanFilesApp:
     # 地址与目录
     # ------------------------------------------------------------------
     def _update_qr(self):
-        current_url = self.url_var.get()
+        current_url = self._share_url(self.url_var.get())
         if not current_url or not generate_qr_photo:
             return
         try:
@@ -568,7 +625,7 @@ class LanFilesApp:
         self.root.after(1500, lambda: (not self._is_closing) and widget.configure(text=original))
 
     def copy_url(self):
-        self.copy_text(self.url_var.get())
+        self.copy_text(self._share_url(self.url_var.get()))
         self.copy_btn.configure(text="已复制 ✓", bg=COLOR_GREEN)
 
         def _restore():
@@ -586,9 +643,7 @@ class LanFilesApp:
 
     def refresh_ips(self):
         self.primary_ip, self.other_ips = get_lan_ips()
-        self.url_var.set(f"http://{self.primary_ip}:{self.server_port}")
-        self._render_other_ips()
-        self._update_qr()
+        self._refresh_address()
 
     def open_spool_directory(self):
         target = self.spool_dir
@@ -615,6 +670,24 @@ class LanFilesApp:
             else:
                 messagebox.showwarning("无写入权限", f"该目录不可写，已保持原目录：\n{self.spool_dir}")
 
+    def _render_security(self):
+        if hasattr(self, "password_state"):
+            self.password_state.configure(text="已启用" if self.settings["password"] else "未设置")
+
+    def apply_password(self):
+        value = self.password_var.get()
+        if len(value) > 128 or any(ord(c) < 32 for c in value):
+            messagebox.showerror("密码无效", "密码不能超过 128 个字符，也不能包含控制字符")
+            return
+        if value == self.settings["password"]:
+            return
+        if value and not messagebox.askyesno("访问密码", "设置新密码后，所有已连接的设备需要重新输入密码或重新扫码。继续吗？"):
+            return
+        self.settings["password"] = value
+        save_settings(self.settings)
+        self.restart_server()
+        self._refresh_address()
+
     def change_port_and_restart(self):
         val = self.port_var.get().strip()
         if not val.isdigit() or not (1024 <= int(val) <= 65535):
@@ -625,10 +698,8 @@ class LanFilesApp:
             messagebox.showwarning("端口已被占用", f"端口 {new_port} 已被占用，请换一个。")
             return
         self.server_port = new_port
-        self.url_var.set(f"http://{self.primary_ip}:{self.server_port}")
-        self._render_other_ips()
-        self._update_qr()
         self.restart_server()
+        self._refresh_address()
 
     # ------------------------------------------------------------------
     # 服务进程
@@ -652,7 +723,9 @@ class LanFilesApp:
             "--max-uploads", str(self.limits.max_uploads),
             "--uploads-per-device", str(self.limits.uploads_per_device),
             "--min-free-space", str(self.limits.min_free_space),
+            "--exit-with-parent",
         ]
+        env = dict(os.environ, LANFILES_PASSWORD=self.settings["password"])  # 不放在命令行参数里
 
         try:
             self.server_process = subprocess.Popen(
@@ -661,7 +734,8 @@ class LanFilesApp:
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                cwd=os.path.dirname(self.transfer_script) or None
+                cwd=os.path.dirname(self.transfer_script) or None,
+                env=env
             )
         except Exception as e:
             self._log(f"[App 错误] 启动服务失败: {e}\n")
@@ -717,7 +791,8 @@ class LanFilesApp:
         fg, bg = (COLOR_GREEN, COLOR_GREEN_BG) if running else (COLOR_RED, COLOR_RED_BG)
         self.status_pill.configure(bg=bg)
         self.status_dot.configure(fg=fg, bg=bg)
-        self.status_text.configure(text=("运行中 · %d" % self.server_port) if running else "已停止", fg=fg, bg=bg)
+        label = "运行中 · %d" % self.server_port
+        self.status_text.configure(text=label if running else "已停止", fg=fg, bg=bg)
         if running:
             self.toggle_btn.set_theme(COLOR_RED, "#FFFFFF", COLOR_RED_HOVER)
             self.toggle_btn.configure(text="停止服务")

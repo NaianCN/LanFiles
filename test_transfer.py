@@ -731,7 +731,9 @@ class TestStore(unittest.TestCase):
         self.assertEqual(Path(legacy).read_bytes(),b"legacy")
 
     def test_single_instance_lock_and_corrupt_database(self):
-        with self.assertRaises(OSError): transfer.Store(self.tmp.name,self.limits)
+        with self.assertRaises(RuntimeError) as busy: transfer.Store(self.tmp.name,self.limits)
+        self.assertIn("已被另一个 LanFiles 服务占用", str(busy.exception))
+        if os.name != "nt": self.assertIn("进程 %d" % os.getpid(), str(busy.exception))
         self.assertEqual(self.store.authenticate(self.token_a)["id"],self.a["id"])
         self.store.close()
         Path(self.tmp.name,".lanfiles","state.sqlite3").write_bytes(b"corrupt database")
@@ -805,6 +807,96 @@ class TestConnectionLimit(unittest.TestCase):
             finally:
                 server.shutdown(); server.server_close(); thread.join()
 
+
+class TestSecurity(unittest.TestCase):
+    """Host 白名单、安全响应头与访问密码。"""
+
+    def start(self, password=None):
+        self.tmp = tempfile.mkdtemp(prefix="lanfiles-sec-")
+        self.server = transfer.create_server("127.0.0.1", 0, self.tmp,
+            transfer.Limits(min_free_space=0, register_per_ip=100, register_global=1000), password)
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, kwargs={"poll_interval": 0.02}, daemon=True)
+        self.thread.start()
+
+    def tearDown(self):
+        if hasattr(self, "server"):
+            self.server.shutdown(); self.server.server_close(); self.thread.join()
+            shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def req(self, method, path, body=None, headers=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=10)
+        conn.request(method, path, body=body, headers=headers or {})
+        resp = conn.getresponse(); data = resp.read(); conn.close()
+        return resp.status, resp.headers, data
+
+    def register(self, body, cookie=None):
+        headers = {"Content-Type": "application/json"}
+        if cookie: headers["Cookie"] = cookie
+        status, headers, data = self.req("POST", "/api/register", json.dumps(body).encode(), headers)
+        return status, json.loads(data), (headers.get("Set-Cookie") or "")
+
+    def test_rejects_unknown_host_names(self):
+        name = socket.gethostname().lower()
+        self.start()
+        self.assertEqual(self.req("GET", "/", headers={"Host": name.removesuffix(".local") + ".local"})[0], 400)
+        for host in ("evil.example", "evil.example:%d" % self.port, "127.0.0.1.evil.example"):
+            self.assertEqual(self.req("GET", "/", headers={"Host": host})[0], 400, host)
+        for host in ("127.0.0.1:%d" % self.port, "localhost:%d" % self.port, "[::1]:%d" % self.port, "192.168.1.9"):
+            self.assertEqual(self.req("GET", "/", headers={"Host": host})[0], 200, host)
+
+    def test_security_headers_and_csp_hashes(self):
+        self.start()
+        status, headers, page = self.req("GET", "/")
+        self.assertEqual(status, 200)
+        csp = headers["Content-Security-Policy"]
+        self.assertIn("frame-ancestors 'none'", csp)
+        self.assertNotIn("unsafe-inline", csp)
+        html = page.decode("utf-8")
+        for tag in ("script", "style"):
+            body = html.split("<%s>" % tag, 1)[1].split("</%s>" % tag, 1)[0]
+            digest = __import__("base64").b64encode(hashlib.sha256(body.encode("utf-8")).digest()).decode()
+            self.assertIn("'sha256-%s'" % digest, csp)
+        self.assertNotIn(' style="', html)
+        status, headers, _ = self.req("GET", "/api/session")
+        self.assertEqual(headers["X-Frame-Options"], "DENY")
+
+    def proof(self, password):
+        status, _, data = self.req("GET", "/api/auth/challenge")
+        nonce = json.loads(data)["nonce"]
+        return {"nonce": nonce, "proof": __import__("hmac").new(password.encode(), nonce.encode(), "sha256").hexdigest()}
+
+    def test_access_password_challenge_response(self):
+        self.start(password="客厅密码abc")
+        status, data, _ = self.register({"name": "A"})
+        self.assertEqual((status, data.get("code")), (401, "password_required"))
+        status, data, _ = self.register({"name": "A", "auth": dict(self.proof("wrong"))})
+        self.assertEqual((status, data.get("code")), (401, "bad_password"))
+        auth = self.proof("客厅密码abc")
+        status, data, cookie = self.register({"name": "A", "auth": auth})
+        self.assertEqual(status, 200)
+        cookie = cookie.split(";", 1)[0]
+        self.assertEqual(self.register({"name": "B", "auth": auth})[0], 401)  # 随机数只能用一次
+        status, data, _ = self.register({"domain": "1234"}, cookie)
+        self.assertEqual((status, data["name"]), (200, "A"))  # 已登录身份无需再验证
+        for _ in range(4):
+            self.register({"auth": self.proof("wrong")})
+        self.assertEqual(self.register({"auth": self.proof("客厅密码abc")})[0], 429)
+
+    def test_password_change_signs_out_existing_devices(self):
+        self.tmp = tempfile.mkdtemp(prefix="lanfiles-sec-")
+        store = transfer.Store(self.tmp)
+        try:
+            store.register("", "旧设备", "", "1.1.1.1")
+            self.assertEqual(store.apply_password(""), 0)
+            self.assertEqual(store.apply_password("one"), 1)
+            store.register("", "新设备", "", "1.1.1.2")
+            self.assertEqual(store.apply_password("one"), 0)
+            self.assertEqual(store.apply_password(""), 0)
+            self.assertEqual(store.apply_password("two"), 1)
+        finally:
+            store.close(); shutil.rmtree(self.tmp, ignore_errors=True)
+        del self.tmp
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

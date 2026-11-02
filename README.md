@@ -1,6 +1,6 @@
 # 局域网传文件（LanFiles）
 
-当前版本：**1.4.0** · 作者：**GPT、Gemini** · 项目维护：**NaianCN**
+当前版本：**1.4.1** · 作者：**GPT、Gemini** · 项目维护：**NaianCN**
 
 [Windows 免安装包](https://raw.githubusercontent.com/NaianCN/LanFiles/main/lanfiles-win.zip) · [macOS 应用包](https://raw.githubusercontent.com/NaianCN/LanFiles/main/lanfiles-macos.zip) · [更新记录](CHANGELOG.md)
 
@@ -37,7 +37,25 @@ Windows 免安装包为 `lanfiles-win.zip`，解压后运行 `start.bat`；其 P
 - 同一浏览器的多个标签页共享一个设备身份；不同浏览器、隐私窗口或设备通常具有不同身份。
 - 私发文件仅收件人可下载和移除。广播文件由当前房间成员下载，只有发送者可移除。
 - 四位房间号只用于分组，**不是密码或邀请凭证**，任何能够连接服务的设备都能加入指定房间。
-- **仅用于可信网络。** HTTP 不提供加密；能够监听链路的人仍可能窃取凭证或文件。默认监听所有 IPv4 网卡，不自动限制源网段；如需限定网卡，用 `--host` 并配置系统防火墙。不要将服务端口暴露到公网。
+- **仅用于可信网络。** HTTP 不加密；能够监听链路的人可以看到文件、窃取登录后的 Cookie。访问密码只能挡住“直接打开页面的人”，挡不住抓包。默认监听所有 IPv4 网卡；如需限定网卡，用 `--host` 并配置系统防火墙。不要将服务端口暴露到公网。
+
+## 访问密码与其他防护
+
+**访问密码**（可选）：桌面版“设置 → 密码”，或命令行用环境变量（不会出现在进程列表）：
+
+```bash
+LANFILES_PASSWORD='你的密码' python3 transfer.py
+```
+
+- 新设备首次进入要输入密码；桌面版的二维码和“复制”链接把密码放在 `#k=` 之后，扫码即可进入。`#` 后的内容不会发送到服务器，页面读取后立即从地址栏清除。
+- 登录用挑战应答：服务器给出一次性随机数（2 分钟有效），浏览器只发送 `HMAC-SHA256(密码, 随机数)`，密码本身不经过网络。同一 IP 5 分钟内错 5 次（全服务 50 次）返回 `429`。
+- 登录后用 Cookie 维持 7 天。修改或首次启用密码会注销全部旧身份，所有设备需重新输入。
+- 桌面版把密码保存在 `~/Library/Application Support/LanFiles/settings.json`（权限 0600）。
+
+**其他防护**
+
+- 只接受 IP 地址和 `localhost` 作为访问地址（`Host`），防止 DNS 重绑定把恶意网站指向本服务；如需用其他域名（如 `电脑名.local`）访问，加 `--allow-host 名称`。
+- 网页带严格的 `Content-Security-Policy`：只允许页面自带的脚本和样式（按哈希放行），禁止被其他网站嵌入框架；所有响应带 `X-Frame-Options: DENY`、`nosniff` 等安全头。
 
 ## 容量和失败处理
 
@@ -91,7 +109,7 @@ Windows 免安装包为 `lanfiles-win.zip`，解压后运行 `start.bat`；其 P
 
 ## HTTP API（用于集成）
 
-`POST /api/register` 仅接受 `{ "name": "设备名", "domain": "1234" }`。已有有效 Cookie 更新当前设备，否则生成新身份；不接受 `device_id`。名称必须为不超过 80 字符的字符串，JSON 最大 16 KiB。
+`POST /api/register` 仅接受 `{ "name": "设备名", "domain": "1234" }`；启用访问密码且没有有效 Cookie 时，还需 `"auth": { "nonce": 随机数, "proof": HMAC-SHA256(密码, 随机数) 的十六进制 }`，缺少时返回 `401` 和 `code: password_required`，错误时为 `bad_password`。已有有效 Cookie 更新当前设备，否则生成新身份；不接受 `device_id`。名称必须为不超过 80 字符的字符串，JSON 最大 16 KiB。
 
 其余接口需要有效 Cookie：
 
@@ -104,6 +122,7 @@ Windows 免安装包为 `lanfiles-win.zip`，解压后运行 `start.bat`；其 P
 | `POST /api/send?to=公开ID&name=文件名` | 私发原始文件字节，需要 Content-Length |
 | `POST /api/send?domain=1234&name=文件名` | 房间广播，与 to 二选一 |
 | `GET /api/download/传输ID` | 下载，浏览器链接自动带 Cookie |
+| `GET /api/auth/challenge` | 无需 Cookie：`required` 表示是否启用访问密码，`nonce` 为一次性随机数 |
 | `GET /api/admin/devices` | 本机管理：所有设备（含房间、IP、在线状态） |
 | `POST /api/admin/delete-device/设备ID` | 本机管理：删除设备 |
 | `POST /api/ack/传输ID` | 移除，`pending` 表示还在等待磁盘删除，重复操作待删除记录仍校验所有者并返回真实状态 |

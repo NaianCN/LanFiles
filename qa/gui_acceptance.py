@@ -16,6 +16,7 @@ from transfer import Limits
 
 with tempfile.TemporaryDirectory(prefix="lanfiles-gui-") as spool:
     app.resolve_spool_dir = lambda desired=None: spool
+    app.SETTINGS_PATH = os.path.join(spool, "settings.json")  # 不读取本机真实的密码设置
     app.find_available_port = lambda preferred=8000: 18765
     app.get_lan_ips = lambda: ("127.0.0.1", [])
     original_popen = subprocess.Popen
