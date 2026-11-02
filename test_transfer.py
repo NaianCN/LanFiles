@@ -603,6 +603,40 @@ class TestStore(unittest.TestCase):
         self.upload()
         self.assert_api_error(429,lambda:self.store.begin_upload(self.a["id"],self.b["id"],"","x",1))
 
+    def test_new_identity_reuses_name_of_same_ip(self):
+        dev,_=self.store.register("",None,"","10.0.0.8")
+        _,first_token=self.store.register("",None,"","10.0.0.9")
+        renamed,_=self.store.register(first_token,"书房电脑",None,"10.0.0.9")
+        self.assertEqual(renamed["name"],"书房电脑")
+        again,token=self.store.register("",None,"","10.0.0.9")
+        self.assertTrue(token); self.assertNotEqual(again["id"],renamed["id"])
+        self.assertEqual(again["name"],"书房电脑")
+        self.assertEqual(self.store.register("",None,"","10.0.0.8")[0]["name"],dev["name"])
+        explicit,_=self.store.register("","新名字",None,"10.0.0.9")
+        self.assertEqual(explicit["name"],"新名字")
+        self.assertEqual(self.store.register("",None,"","10.0.0.9")[0]["name"],"新名字")
+        with mock.patch("transfer.time.time",return_value=time.time()+transfer.NAME_MEMORY_TTL+1):
+            self.store.cleanup()
+        self.assertEqual(self.store.db.execute("SELECT COUNT(*) FROM names").fetchone()[0],0)
+
+    def test_uploads_per_device_limit(self):
+        self.store.limits=replace(self.limits,max_uploads=4,uploads_per_device=2)
+        first=self.store.begin_upload(self.a["id"],self.b["id"],"","x",1)
+        second=self.store.begin_upload(self.a["id"],self.b["id"],"","y",1)
+        self.assert_api_error(429,lambda:self.store.begin_upload(self.a["id"],self.b["id"],"","z",1))
+        other=self.store.begin_upload(self.b["id"],self.a["id"],"","x",1)
+        for tid in (first,second,other): self.store.cancel_upload(tid)
+
+    def test_disk_floor_rechecked_after_interval(self):
+        tid=self.store.begin_upload(self.a["id"],self.b["id"],"","x",4)
+        with open(self.store.file_path(tid,True),"wb",buffering=0) as f:
+            self.store.write_chunk(tid,f,b"a")
+            with mock.patch("transfer.DISK_CHECK_INTERVAL",2), mock.patch("transfer.shutil.disk_usage",side_effect=OSError("disk error")) as usage:
+                self.store.write_chunk(tid,f,b"b")
+                usage.assert_not_called()
+                with self.assertRaises(OSError): self.store.write_chunk(tid,f,b"c")
+        self.store.cancel_upload(tid)
+
     def test_partial_disk_write_is_completed_before_publication(self):
         tid=self.store.begin_upload(self.a["id"],self.b["id"],"","x",3)
         with open(self.store.file_path(tid,True),"wb",buffering=0) as file:

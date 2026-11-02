@@ -1,8 +1,8 @@
 # 局域网传文件（LanFiles）
 
-当前版本：**1.2.0** · 作者：**GPT、Gemini** · 项目维护：**NaianCN**
+当前版本：**1.3.0** · 作者：**GPT、Gemini** · 项目维护：**NaianCN**
 
-[Windows 免安装包](https://raw.githubusercontent.com/NaianCN/LanFiles/770db0b969509cfa0a6b0a0389051ed1ca155d2b/lanfiles-win.zip) · [macOS 应用包](https://raw.githubusercontent.com/NaianCN/LanFiles/770db0b969509cfa0a6b0a0389051ed1ca155d2b/lanfiles-macos.zip) · [更新记录](CHANGELOG.md)
+[Windows 免安装包](https://raw.githubusercontent.com/NaianCN/LanFiles/main/lanfiles-win.zip) · [macOS 应用包](https://raw.githubusercontent.com/NaianCN/LanFiles/main/lanfiles-macos.zip) · [更新记录](CHANGELOG.md)
 
 Python 标准库实现的局域网文件互传工具。电脑启动服务后，其他设备用浏览器打开地址，即可私发文件或在同一房间内共享。支持 macOS、Windows、Linux，不需要安装第三方 Python 包。
 
@@ -16,10 +16,10 @@ python3 transfer.py
 
 ```bash
 python3 transfer.py --host 192.168.5.10 --port 9000 --dir ~/lanfiles \
-  --max-file-size 10GiB --spool-quota 20GiB --max-uploads 4 --min-free-space 1GiB
+  --max-file-size 10GiB --spool-quota 20GiB --max-uploads 4 --uploads-per-device 3 --min-free-space 1GiB
 ```
 
-容量参数接受非负整数字节数或 `KiB/MiB/GiB`；同时上传数量必须大于零。端口或目录不可用、目录已有运行实例、数据库损坏时，会明确报错并停止启动。
+容量参数接受非负整数字节数或 `KiB/MiB/GiB`；同时上传数量（总数及每设备）必须大于零。端口或目录不可用、目录已有运行实例、数据库损坏时，会明确报错并停止启动。
 
 macOS 桌面入口为解压 `lanfiles-macos.zip` 后的 `LanFiles.app`，也可在源码目录运行 `python3 app.py`。桌面版需要本机有带 Tk 8.6+ 的 Python，支持相同四个容量参数：
 
@@ -32,6 +32,7 @@ Windows 免安装包为 `lanfiles-win.zip`，解压后运行 `start.bat`；其 P
 ## 设备、房间和安全边界
 
 - 打开网页即可加入。服务端为浏览器生成公开设备 ID 和独立随机私密凭证；设备列表仅公开 ID，不能用它冒充他人。
+- 首次打开会分配随机名字，可直接修改或点 🎲 换一个；名字保存在本浏览器（localStorage），之后每次打开都沿用，即使 Cookie 失效建立了新身份也会自动改回。服务端还会按设备 IP 记住最近用的名字（保留 30 天）：清除浏览数据、换浏览器或换访问地址后，只要设备 IP 不变，新身份会自动沿用原名字。建议在路由器中给常用设备绑定固定 IP；同一 IP 上的多个浏览器默认同名，可分别修改。
 - 私密凭证只通过主机 Cookie 传递：`HttpOnly; SameSite=Strict; Path=/`，有效期自创建起 7 天。数据库仅保存摘要，凭证不会放入网页、JSON、下载 URL 或日志。
 - 同一浏览器的多个标签页共享一个设备身份；不同浏览器、隐私窗口或设备通常具有不同身份。
 - 私发文件仅收件人可下载和移除。广播文件由当前房间成员下载，只有发送者可移除。
@@ -44,7 +45,7 @@ Windows 免安装包为 `lanfiles-win.zip`，解压后运行 `start.bat`；其 P
 |---|---:|
 | 单文件 | 10 GiB |
 | 已保存文件与上传预留空间 | 合计 20 GiB |
-| 同时上传 | 4 个，每设备 1 个 |
+| 同时上传 | 4 个，每设备 3 个 |
 | 磁盘安全余量 | 1 GiB |
 | HTTP 连接 | 64 个 |
 | 登记设备 | 256 个，身份到期后回收 |
@@ -53,7 +54,7 @@ Windows 免安装包为 `lanfiles-win.zip`，解压后运行 `start.bat`；其 P
 | 单次上传最长时间 | 6 小时 |
 | 注册及档案修改 | 每 IP 每分钟 10 次，全服务每分钟 100 次 |
 
-网页按顺序上传多个文件，入队时固定收件人或房间，之后切换选择不会改变已排队文件去向。“已上传”表示文件已经完整保存到中转，尚不表示收件人已经下载。
+网页按入队顺序并行上传多个文件（并发数等于每设备上限），显示实时速度和剩余时间；入队时固定收件人或房间，之后切换选择不会改变已排队文件去向。下载使用 `sendfile` 零拷贝（Windows 自动退回普通发送）。“已上传”表示文件已经完整保存到中转，尚不表示收件人已经下载。
 
 零字节文件允许上传。缺失、重复或非法内容长度、分块请求、短上传、超时和写入失败不会投递残片。超大文件为 `413`，数量或限速为 `429`，配额或磁盘不足为 `507`，连接过载为 `503`。上传失败不自动重发，以免重复投递。
 

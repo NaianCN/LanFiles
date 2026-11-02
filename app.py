@@ -785,6 +785,7 @@ class LanFilesApp:
             "--max-file-size", str(self.limits.max_file_size),
             "--spool-quota", str(self.limits.spool_quota),
             "--max-uploads", str(self.limits.max_uploads),
+            "--uploads-per-device", str(self.limits.uploads_per_device),
             "--min-free-space", str(self.limits.min_free_space),
         ]
 

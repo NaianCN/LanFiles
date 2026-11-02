@@ -44,6 +44,7 @@ OFFLINE_TTL = 10.0       # 多少秒没有心跳视为离线
 FILE_TTL = 3600.0        # 未投递文件保留多少秒后被清理
 CLEANUP_INTERVAL = 60.0  # 清理线程扫描间隔（秒）
 CHUNK_SIZE = 1024 * 1024 # 读写分块大小（1MB）
+DISK_CHECK_INTERVAL = 64 * 1024 * 1024  # 上传中每写入这么多字节复查一次磁盘余量
 DOMAIN_RE = re.compile(r"[0-9]{4}")  # 域号：4 位数字（含前导 0）
 
 ADJECTIVES = ["晴空", "快乐", "安静", "勇敢", "温柔", "机灵", "好奇", "闪电", "微风", "星辰",
@@ -85,6 +86,7 @@ def ensure_spool_dir(target):
 # 持久化登记、身份、资源限制
 # ---------------------------------------------------------------------------
 SESSION_TTL = 7 * 24 * 3600
+NAME_MEMORY_TTL = 30 * 24 * 3600  # 按来源 IP 记住的名字保留多久
 COOKIE_NAME = "lanfiles_session"
 ID_RE = re.compile(r"^[0-9a-f]{32}$")
 
@@ -94,6 +96,7 @@ class Limits:
     max_file_size: int = 10 * 1024**3
     spool_quota: int = 20 * 1024**3
     max_uploads: int = 4
+    uploads_per_device: int = 3
     min_free_space: int = 1024**3
     max_connections: int = 64
     max_devices: int = 256
@@ -107,7 +110,7 @@ class Limits:
         for name in ("max_file_size", "spool_quota", "min_free_space"):
             if getattr(self, name) < 0:
                 raise ValueError(name + " 必须非负")
-        for name in ("max_uploads", "max_connections", "max_devices", "max_transfers",
+        for name in ("max_uploads", "uploads_per_device", "max_connections", "max_devices", "max_transfers",
                      "io_timeout", "upload_timeout", "register_per_ip", "register_global"):
             if getattr(self, name) <= 0:
                 raise ValueError(name + " 必须大于零")
@@ -133,6 +136,7 @@ class Store:
         self._lock = threading.RLock()
         self._readers = {}
         self._written = {}
+        self._checked = {}
         self._seen = {}
         self._registrations = deque()
         self._instance = None
@@ -178,6 +182,9 @@ class Store:
                     sender TEXT NOT NULL, sender_name TEXT NOT NULL, target TEXT,
                     domain TEXT NOT NULL, filename TEXT NOT NULL,
                     expected INTEGER NOT NULL, size INTEGER NOT NULL, created REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS names (
+                    addr TEXT PRIMARY KEY, name TEXT NOT NULL, updated REAL NOT NULL
                 );
                 PRAGMA user_version=1;
             ''')
@@ -256,9 +263,16 @@ class Store:
                     if self.db.execute("SELECT COUNT(*) FROM devices").fetchone()[0] >= self.limits.max_devices:
                         raise APIError(429, "设备登记已达上限，请等待旧身份过期")
                     did, new_token = uuid.uuid4().hex, secrets.token_urlsafe(32)
+                    if not name:
+                        # 浏览器没带名字（清过数据、换了浏览器）时，沿用该 IP 上次用的名字。
+                        row = self.db.execute("SELECT name FROM names WHERE addr=? AND updated>?",
+                                              (addr, now - NAME_MEMORY_TTL)).fetchone()
+                        name = row[0] if row else random_name()
                     self.db.execute("INSERT INTO devices VALUES (?,?,?,?,?,?,?,?)", (
                         did, hashlib.sha256(new_token.encode("ascii")).hexdigest(),
-                        name or random_name(), domain or "", addr, now, now + SESSION_TTL, now))
+                        name, domain or "", addr, now, now + SESSION_TTL, now))
+                self.db.execute("INSERT OR REPLACE INTO names VALUES (?,?,?)",
+                                (addr, name or dev["name"], now))
             self._seen[did] = now
             return self._device(did), new_token
 
@@ -303,7 +317,8 @@ class Store:
             if total > self.limits.max_file_size:
                 raise APIError(413, "文件超过单文件上限")
             active = list(self.db.execute("SELECT sender FROM transfers WHERE state='uploading'"))
-            if len(active) >= self.limits.max_uploads or any(row[0] == did for row in active):
+            if len(active) >= self.limits.max_uploads or sum(
+                    row[0] == did for row in active) >= self.limits.uploads_per_device:
                 raise APIError(429, "上传并发已满，请稍后重试")
             if self.db.execute("SELECT COUNT(*) FROM transfers").fetchone()[0] >= self.limits.max_transfers:
                 raise APIError(429, "传输登记已达上限")
@@ -320,16 +335,22 @@ class Store:
             return tid
 
     def write_chunk(self, tid, file, chunk):
+        # 余量按区间抽查、写盘不持全局锁：逐块 statvfs + 查库会让并发上传互相等待。
         with self._lock:
-            if shutil.disk_usage(self.blob_dir).free < self._unwritten() + self.limits.min_free_space:
-                raise APIError(507, "磁盘可用空间不足")
-            view = memoryview(chunk)
-            while view:
-                written = file.write(view)
-                if not written:
-                    raise OSError("磁盘写入未取得进展")
-                self._written[tid] += written
-                view = view[written:]
+            done = self._written[tid]
+            last = self._checked.get(tid)
+            if last is None or done - last >= DISK_CHECK_INTERVAL:
+                if shutil.disk_usage(self.blob_dir).free < self._unwritten() + self.limits.min_free_space:
+                    raise APIError(507, "磁盘可用空间不足")
+                self._checked[tid] = done
+        view = memoryview(chunk)
+        while view:
+            written = file.write(view)
+            if not written:
+                raise OSError("磁盘写入未取得进展")
+            view = view[written:]
+        with self._lock:
+            self._written[tid] += len(chunk)
 
     def finish_upload(self, tid):
         with self._lock:
@@ -340,6 +361,7 @@ class Store:
             with self.db:
                 self.db.execute("UPDATE transfers SET state='ready',size=expected,created=? WHERE transfer_id=?", (time.time(), tid))
             self._written.pop(tid, None)
+            self._checked.pop(tid, None)
             return {"transfer_id": tid, "size": row["expected"], "filename": row["filename"],
                     "kind": "direct" if row["target"] else "domain"}
 
@@ -353,6 +375,7 @@ class Store:
         with self.db:
             self.db.execute("UPDATE transfers SET state='deleting',size=? WHERE transfer_id=?", (size, tid))
         self._written.pop(tid, None)
+        self._checked.pop(tid, None)
 
     def _delete(self, tid):
         if self._readers.get(tid):
@@ -382,6 +405,7 @@ class Store:
                 self._delete(row[0])
             with self.db:
                 self.db.execute("DELETE FROM devices WHERE expires<=?", (now,))
+                self.db.execute("DELETE FROM names WHERE updated<=?", (now - NAME_MEMORY_TTL,))
             expired_seen = [did for did in self._seen if self._device(did) is None]
             for did in expired_seen:
                 self._seen.pop(did, None)
@@ -600,12 +624,14 @@ def add_limit_arguments(parser):
     parser.add_argument("--max-file-size", type=parse_size, default=10*1024**3)
     parser.add_argument("--spool-quota", type=parse_size, default=20*1024**3)
     parser.add_argument("--max-uploads", type=int, default=4)
+    parser.add_argument("--uploads-per-device", type=int, default=3)
     parser.add_argument("--min-free-space", type=parse_size, default=1024**3)
 
 
 def limits_from_args(args):
     return Limits(max_file_size=args.max_file_size, spool_quota=args.spool_quota,
-                  max_uploads=args.max_uploads, min_free_space=args.min_free_space)
+                  max_uploads=args.max_uploads, uploads_per_device=args.uploads_per_device,
+                  min_free_space=args.min_free_space)
 
 
 # ---------------------------------------------------------------------------
@@ -773,7 +799,8 @@ class Handler(BaseHTTPRequestHandler):
         return {"device_id": dev["id"], "name": dev["name"], "domain": dev["domain"],
                 "limits": {"max_file_size": self.store.limits.max_file_size,
                            "spool_quota": self.store.limits.spool_quota,
-                           "max_uploads": self.store.limits.max_uploads}}
+                           "max_uploads": self.store.limits.max_uploads,
+                           "uploads_per_device": self.store.limits.uploads_per_device}}
 
     def _api_send(self, qs, dev):
         total = self._length(required=True)
@@ -827,7 +854,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
-            shutil.copyfileobj(file, self.wfile, CHUNK_SIZE)
+            # sendfile 走内核零拷贝；不支持的平台（如 Windows）自动退回普通 send。
+            self.connection.sendfile(file)
         finally:
             file.close()
             self.store.release_download(tid)
@@ -841,19 +869,42 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>局域网传文件</title>
 <style>
 :root {
   --bg: #F2F2F7;
   --card: #FFFFFF;
   --separator: #E5E5EA;
-  --text: #000000;
+  --text: #1C1C1E;
   --secondary: #8E8E93;
   --header: #6D6D72;
   --accent: #007AFF;
+  --accent-soft: rgba(0, 122, 255, 0.10);
+  --purple: #AF52DE;
   --green: #34C759;
   --red: #FF3B30;
+  --orange: #FF9500;
   --fill: rgba(118, 118, 128, 0.12);
+  --shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 16px rgba(0,0,0,.04);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #000000;
+    --card: #1C1C1E;
+    --separator: #38383A;
+    --text: #F2F2F7;
+    --secondary: #8E8E93;
+    --header: #98989F;
+    --accent: #0A84FF;
+    --accent-soft: rgba(10, 132, 255, 0.18);
+    --purple: #BF5AF2;
+    --green: #30D158;
+    --red: #FF453A;
+    --orange: #FF9F0A;
+    --fill: rgba(118, 118, 128, 0.24);
+    --shadow: none;
+  }
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
 html, body { margin: 0; padding: 0; }
@@ -864,212 +915,273 @@ body {
   min-height: 100vh;
   -webkit-font-smoothing: antialiased;
 }
-.app { max-width: 680px; margin: 0 auto; padding: 16px; }
+.app { max-width: 1120px; margin: 0 auto; padding: 16px 16px 32px; }
 
-/* iOS 大标题 */
-.topbar { display: flex; align-items: center; gap: 12px; padding: 8px 4px 4px; }
-.topbar h1 { font-size: 30px; font-weight: 700; margin: 0; flex: 1; }
-.me-name { display: flex; align-items: center; gap: 8px; }
-.me-name label { font-size: 14px; color: var(--secondary); }
-.me-name input {
-  width: 108px; padding: 8px 12px; font-size: 15px; border: none; border-radius: 10px;
-  background: var(--fill); color: var(--text); outline: none;
-}
+/* 顶栏 */
+.topbar { display: flex; align-items: center; gap: 12px; padding: 4px 4px 14px; flex-wrap: wrap; }
+.brand { display: flex; align-items: center; gap: 10px; flex: 1; min-width: 0; }
+.logo { width: 36px; height: 36px; border-radius: 10px; flex: none; background: linear-gradient(135deg, #34AADC, #007AFF); color: #fff; display: flex; align-items: center; justify-content: center; font-size: 18px; }
+.brand h1 { font-size: 22px; font-weight: 700; margin: 0; white-space: nowrap; }
+.status-pill { display: inline-flex; align-items: center; gap: 6px; max-width: 100%; padding: 6px 12px; border-radius: 999px; background: var(--card); box-shadow: var(--shadow); font-size: 13px; color: var(--secondary); }
+.status-pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--orange); flex: none; }
+.status-pill.ok .dot { background: var(--green); }
+.status-pill.err { color: var(--red); }
+.status-pill.err .dot { background: var(--red); }
+#connection-status { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.notice { font-size: 13px; color: var(--red); background: var(--card); border-radius: 12px; padding: 10px 14px; margin: 0 0 14px; box-shadow: var(--shadow); }
 
-/* 区块 */
-.section { margin-bottom: 22px; }
-.section-head { display: flex; align-items: center; justify-content: space-between; padding: 0 16px; margin: 0 0 8px; }
-.section-head h2 { font-size: 13px; font-weight: 400; color: var(--header); margin: 0; letter-spacing: .2px; }
-.section-head .hint { font-size: 12px; color: var(--secondary); }
+/* 两栏 */
+.layout { display: grid; gap: 20px; grid-template-columns: minmax(0, 1fr); align-items: start; }
+@media (min-width: 900px) { .layout { grid-template-columns: minmax(0, 5fr) minmax(0, 6fr); } }
+.col { display: grid; gap: 20px; min-width: 0; }
 
-/* iOS 分组列表：白色圆角容器 + 行间分割线 */
-.ios-list {
-  list-style: none; margin: 0; padding: 0;
-  background: var(--card); border-radius: 10px; overflow: hidden;
+/* 卡片与区块 */
+.card { background: var(--card); border-radius: 14px; box-shadow: var(--shadow); overflow: hidden; }
+.section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 6px; margin: 0 0 8px; min-height: 22px; }
+.section-head h2 { font-size: 13px; font-weight: 600; color: var(--header); margin: 0; letter-spacing: .3px; }
+.section-head .hint { font-size: 12px; color: var(--secondary); text-align: right; }
+
+/* 我的身份 + 房间 */
+.me-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; }
+.me-field { flex: 1; min-width: 0; }
+.me-field label { display: block; font-size: 12px; color: var(--secondary); margin-bottom: 4px; }
+.name-box { display: flex; gap: 6px; align-items: center; }
+.name-box input {
+  flex: 1; min-width: 0; padding: 8px 12px; font-size: 16px; font-weight: 600; border: none; border-radius: 10px;
+  background: var(--fill); color: var(--text); outline: none; font-family: inherit;
 }
-.ios-row {
-  display: flex; align-items: center; gap: 12px; padding: 12px 16px;
-  background: var(--card); min-height: 56px;
+.name-box input:focus, .room-box input:focus { box-shadow: 0 0 0 2px var(--accent); }
+.icon-btn { width: 36px; height: 36px; border-radius: 10px; background: var(--fill); font-size: 18px; flex: none; display: inline-flex; align-items: center; justify-content: center; }
+.icon-btn:active { opacity: .6; }
+.room-row { display: flex; align-items: center; gap: 10px; padding: 12px 16px; border-top: 0.5px solid var(--separator); flex-wrap: wrap; }
+.room-box { display: flex; align-items: center; gap: 8px; }
+.room-box input {
+  width: 92px; padding: 7px 0; font-size: 18px; letter-spacing: 5px; text-align: center; font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  border: none; border-radius: 10px; background: var(--fill); color: var(--text); outline: none;
 }
+.domain-status { flex: 1; font-size: 13px; color: var(--secondary); min-width: 150px; }
+.domain-status b { color: var(--accent); }
+.pill { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; background: var(--fill); color: var(--secondary); }
+
+/* 列表 */
+.ios-list { list-style: none; margin: 0; padding: 0; }
+.ios-row { display: flex; align-items: center; gap: 12px; padding: 11px 16px; min-height: 58px; }
 .ios-row + .ios-row { border-top: 0.5px solid var(--separator); }
-.ios-row.empty { justify-content: center; color: var(--secondary); font-size: 14px; }
+.ios-row.empty { justify-content: center; color: var(--secondary); font-size: 14px; min-height: 64px; }
 
-/* 设备行 */
+/* 设备 */
 .device { cursor: pointer; transition: background .15s ease; }
+.device:hover { background: var(--fill); }
 .device.offline { opacity: .45; cursor: not-allowed; }
-.device.selected { background: rgba(0, 122, 255, 0.08); }
+.device.offline:hover { background: none; }
+.device.selected, .device.selected:hover { background: var(--accent-soft); }
 .device.selected .dname { color: var(--accent); }
 .avatar {
   position: relative; width: 40px; height: 40px; border-radius: 50%; flex: none;
   display: flex; align-items: center; justify-content: center;
   color: #fff; font-size: 17px; font-weight: 600;
 }
-.adot {
-  position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px;
-  border-radius: 50%; background: var(--green); border: 2px solid #fff;
-}
+.avatar.lg { width: 48px; height: 48px; font-size: 20px; }
+.adot { position: absolute; right: -1px; bottom: -1px; width: 12px; height: 12px; border-radius: 50%; background: var(--green); border: 2px solid var(--card); }
 .adot.off { background: #C7C7CC; }
 .dmeta { flex: 1; min-width: 0; }
-.dname { font-size: 17px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.dsub { font-size: 13px; color: var(--secondary); margin-top: 2px; }
-.check { color: var(--accent); font-size: 20px; font-weight: 700; opacity: 0; flex: none; }
-.device.selected .check { opacity: 1; }
+.dname { font-size: 16px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dsub { font-size: 12px; color: var(--secondary); margin-top: 2px; }
+.check { width: 22px; height: 22px; border-radius: 50%; border: 1.5px solid var(--separator); flex: none; display: flex; align-items: center; justify-content: center; color: #fff; font-size: 13px; font-weight: 700; }
+.device.selected .check { background: var(--accent); border-color: var(--accent); }
 
-/* 收件箱行 */
-.ficon { width: 40px; height: 40px; border-radius: 10px; flex: none; background: rgba(0,122,255,.10); color: var(--accent); display: flex; align-items: center; justify-content: center; font-size: 18px; }
-.fmeta { flex: 1; min-width: 0; }
-.fname { font-size: 17px; font-weight: 400; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.fsub { font-size: 13px; color: var(--secondary); margin-top: 2px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
-.tag { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; }
-.tag.direct { background: rgba(0,122,255,.12); color: var(--accent); }
-.tag.domain { background: rgba(175,82,222,.12); color: #AF52DE; }
-
-/* 按钮（iOS 文本/实心按钮） */
-button { cursor: pointer; font-family: inherit; border: none; background: none; font-size: 15px; color: var(--accent); padding: 0; }
-.btn { padding: 7px 16px; border-radius: 12px; background: var(--accent); color: #fff; font-weight: 600; }
-.btn:active { opacity: .6; }
-.btn.ghost { background: transparent; color: var(--accent); }
-.btn.destructive { background: transparent; color: var(--red); }
-.btn.small { font-size: 14px; }
-.link-btn { color: var(--accent); font-size: 15px; flex: none; }
-.link-btn.destructive { color: var(--red); }
-a.dl { text-decoration: none; }
-
-/* 域号 */
-.domain-row { display: flex; gap: 10px; align-items: center; padding: 12px 16px; flex-wrap: wrap; }
-.domain-row input {
-  width: 96px; padding: 9px 0; font-size: 20px; letter-spacing: 6px; text-align: center;
-  border: none; border-radius: 10px; background: var(--fill); color: var(--text); outline: none;
-}
-.domain-status { flex: 1; font-size: 14px; color: var(--secondary); min-width: 140px; }
-.domain-status b { color: var(--accent); }
-.pill { display: inline-flex; align-items: center; padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600; background: rgba(118,118,128,.15); color: var(--secondary); }
-
-/* 拖放区 */
+/* 发送 */
+.send-card { padding: 14px; }
+.send-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 2px 10px; }
+.send-head h3 { margin: 0; font-size: 15px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .dropzone {
-  border: 1.5px dashed rgba(0,122,255,.4); border-radius: 12px; padding: 26px 16px; text-align: center;
-  color: var(--secondary); cursor: pointer; background: var(--card); transition: all .15s; margin: 0 0 4px;
+  border: 1.5px dashed color-mix(in srgb, var(--accent) 45%, transparent); border-radius: 12px; padding: 22px 14px; text-align: center;
+  color: var(--secondary); cursor: pointer; transition: background .15s, border-color .15s;
 }
-.dropzone.drag { border-color: var(--accent); background: rgba(0,122,255,.06); color: var(--accent); }
-.dropzone .big { font-size: 26px; }
-.dropzone b { display: block; color: var(--text); margin: 6px 0 2px; font-size: 15px; font-weight: 600; }
-.dropzone small { font-size: 13px; color: var(--secondary); }
+.dropzone:hover { background: var(--accent-soft); }
+.dropzone.drag { border-color: var(--accent); background: var(--accent-soft); color: var(--accent); }
+.dropzone.purple { border-color: color-mix(in srgb, var(--purple) 45%, transparent); }
+.dropzone.purple:hover, .dropzone.purple.drag { background: color-mix(in srgb, var(--purple) 10%, transparent); border-color: var(--purple); }
+.dropzone .big { font-size: 26px; line-height: 1; }
+.dropzone b { display: block; color: var(--text); margin: 8px 0 3px; font-size: 15px; font-weight: 600; }
+.dropzone small { font-size: 12px; color: var(--secondary); }
+.send-hint { padding: 22px 16px; text-align: center; color: var(--secondary); font-size: 14px; line-height: 1.6; }
 
-/* 发送进度 */
-.sends { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 6px; }
-.send-item { display: flex; align-items: center; gap: 10px; padding: 10px 16px; border-radius: 10px; background: var(--card); }
-.send-item .nm { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
-.bar { flex: none; width: 100px; height: 5px; border-radius: 3px; background: rgba(118,118,128,.2); overflow: hidden; }
-.bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .1s; }
-.send-item .st { flex: none; font-size: 13px; color: var(--secondary); width: 60px; text-align: right; }
+/* 上传记录 */
+.sends { list-style: none; margin: 0; padding: 0; }
+.sends:empty { display: none; }
+.sends + .sends:not(:empty) { border-top: 0.5px solid var(--separator); }
+.send-item { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 6px 10px; align-items: center; padding: 11px 16px; }
+.send-item + .send-item { border-top: 0.5px solid var(--separator); }
+.send-item .nm { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; font-weight: 500; }
+.send-item .st { font-size: 12px; color: var(--secondary); text-align: right; white-space: nowrap; }
 .send-item .st.ok { color: var(--green); }
-.send-item .st.err { color: var(--red); }
+.send-item .st.err { color: var(--red); white-space: normal; overflow-wrap: anywhere; }
+.bar { grid-column: 1 / -1; height: 4px; border-radius: 2px; background: var(--fill); overflow: hidden; }
+.bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s linear; }
+.send-item.done .bar > i { background: var(--green); }
+.send-item.failed .bar > i { background: var(--red); }
+.send-item .sp { grid-column: 1 / -1; font-size: 12px; color: var(--secondary); font-variant-numeric: tabular-nums; }
+.upload-total { font-variant-numeric: tabular-nums; }
 
-button:disabled { opacity: .45; cursor: not-allowed; }
-.file-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 16px; background: var(--card); border-radius: 10px; flex-wrap: wrap; }
-.file-toolbar label { display: flex; align-items: center; gap: 8px; font-size: 14px; }
+/* 文件 */
+.file-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 16px; border-bottom: 0.5px solid var(--separator); flex-wrap: wrap; }
+.file-toolbar label { display: flex; align-items: center; gap: 8px; font-size: 14px; cursor: pointer; }
 .file-select, #select-all-files { width: 18px; height: 18px; flex: none; accent-color: var(--accent); cursor: pointer; margin: 0; }
-.file-actions { display: flex; gap: 12px; align-items: center; flex: none; }
-.file-result { font-size: 13px; color: var(--secondary); margin: 8px 16px; line-height: 1.5; overflow-wrap: anywhere; }
+.sub-head { padding: 10px 16px 4px; font-size: 12px; font-weight: 600; color: var(--header); display: flex; justify-content: space-between; gap: 8px; }
+.sub-head span { font-weight: 400; color: var(--secondary); }
+.sub-head.split { border-top: 0.5px solid var(--separator); margin-top: 4px; }
+.ficon { width: 40px; height: 40px; border-radius: 10px; flex: none; background: var(--accent-soft); display: flex; align-items: center; justify-content: center; font-size: 19px; }
+.fmeta { flex: 1; min-width: 0; }
+.fname { font-size: 15px; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fsub { font-size: 12px; color: var(--secondary); margin-top: 3px; display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.tag { font-size: 11px; font-weight: 600; padding: 1px 7px; border-radius: 999px; }
+.tag.direct { background: var(--accent-soft); color: var(--accent); }
+.tag.domain { background: color-mix(in srgb, var(--purple) 14%, transparent); color: var(--purple); }
+.tag.pending { background: color-mix(in srgb, var(--orange) 16%, transparent); color: var(--orange); }
+.file-actions { display: flex; gap: 8px; align-items: center; flex: none; }
+.file-result { font-size: 13px; color: var(--secondary); margin: 8px 6px 0; line-height: 1.5; overflow-wrap: anywhere; }
+.file-result:empty { display: none; }
 .file-note, .file-error { font-size: 12px; margin-top: 4px; line-height: 1.4; overflow-wrap: anywhere; }
 .file-note { color: var(--secondary); }
 .file-error { color: var(--red); }
+
+/* 按钮 */
+button { cursor: pointer; font-family: inherit; border: none; background: none; font-size: 15px; color: var(--accent); padding: 0; }
+button:disabled { opacity: .45; cursor: not-allowed; }
+.btn { padding: 7px 14px; border-radius: 10px; background: var(--accent); color: #fff; font-weight: 600; font-size: 14px; white-space: nowrap; }
+.btn:active { opacity: .6; }
+.btn.ghost { background: var(--fill); color: var(--accent); }
+.btn.destructive { background: transparent; color: var(--red); padding: 7px 4px; }
+.link-btn { color: var(--accent); font-size: 14px; flex: none; }
+.link-btn.destructive { color: var(--red); }
+a.dl { text-decoration: none; padding: 6px 12px; border-radius: 999px; background: var(--accent-soft); font-weight: 600; font-size: 13px; }
+a.dl:active { opacity: .6; }
+.file-actions .link-btn.destructive { font-size: 13px; padding: 6px 4px; }
+
+.footer { font-size: 12px; color: var(--secondary); text-align: center; margin-top: 24px; line-height: 1.6; }
+
 @media (max-width: 480px) {
-  .file-item { gap: 8px; padding: 12px; }
-  .file-item .ficon { width: 30px; height: 34px; font-size: 16px; }
-  .file-item .fname { font-size: 15px; }
-  .file-actions { flex-direction: column; gap: 8px; }
-  .file-toolbar { padding: 10px 12px; }
+  .app { padding: 12px 12px 28px; }
+  .brand h1 { font-size: 20px; }
+  .ios-row { padding: 10px 12px; gap: 10px; }
+  .file-item .ficon { width: 34px; height: 34px; font-size: 17px; }
+  .file-item .fname { font-size: 14px; }
+  .file-actions { flex-direction: column; gap: 4px; }
+  .file-toolbar, .me-row, .room-row, .send-item, .sub-head { padding-left: 12px; padding-right: 12px; }
 }
 .hidden { display: none !important; }
 </style>
 </head>
 <body>
 <div class="app">
-  <div class="topbar">
-    <h1>局域网传文件</h1>
-    <div class="me-name">
-      <label>我是</label>
-      <input id="my-name" maxlength="80" placeholder="我的名字">
+  <header class="topbar">
+    <div class="brand"><div class="logo">⇄</div><h1>局域网传文件</h1></div>
+    <div class="status-pill" id="status-pill"><span class="dot"></span><span id="connection-status" role="status">正在连接…</span></div>
+  </header>
+  <div id="identity-notice" role="alert" class="notice hidden"></div>
+
+  <div class="layout">
+    <div class="col">
+      <section>
+        <div class="section-head"><h2>我的设备</h2><span class="hint">名字保存在本浏览器，下次打开自动使用</span></div>
+        <div class="card">
+          <div class="me-row">
+            <div class="avatar lg" id="me-avatar">?</div>
+            <div class="me-field">
+              <label for="my-name">我的名字</label>
+              <div class="name-box">
+                <input id="my-name" maxlength="80" placeholder="我的名字" autocomplete="off">
+                <button class="icon-btn" id="name-dice" title="换一个随机名字" aria-label="换一个随机名字">🎲</button>
+              </div>
+            </div>
+          </div>
+          <div class="room-row">
+            <div class="room-box">
+              <input id="domain-input" maxlength="4" inputmode="numeric" pattern="[0-9]*" placeholder="房间号" aria-label="4 位房间号">
+              <button class="btn" id="domain-join">加入</button>
+              <button class="btn ghost hidden" id="domain-leave">退出</button>
+            </div>
+            <div class="domain-status" id="domain-status"></div>
+          </div>
+        </div>
+      </section>
+
+      <section>
+        <div class="section-head"><h2 id="devices-title">在线设备</h2><span class="hint" id="devices-hint"></span></div>
+        <div class="card"><ul class="ios-list" id="device-list"><li class="ios-row empty">正在发现设备…</li></ul></div>
+      </section>
+
+      <section>
+        <div class="section-head"><h2>发送</h2><span class="hint">可多选文件，自动并行上传</span></div>
+        <div class="card">
+          <div class="send-hint" id="send-hint">点上方的设备即可私发文件<br>加入房间后还可以发给房间内所有人</div>
+          <div class="send-card hidden" id="session-panel">
+            <div class="send-head">
+              <h3 id="peer-name">发给 …</h3>
+              <button class="link-btn destructive" id="deselect-btn">取消选择</button>
+            </div>
+            <div class="dropzone" id="dropzone">
+              <div class="big">📤</div>
+              <b>拖拽文件到这里，或点击选择</b>
+              <small>一对一私发 · 支持大文件、中文文件名</small>
+            </div>
+            <input type="file" id="file-input" multiple class="hidden">
+          </div>
+          <div class="send-card hidden" id="broadcast-panel">
+            <div class="send-head"><h3>发给房间内所有人</h3><span class="hint" id="broadcast-hint" style="font-size:12px;color:var(--secondary)"></span></div>
+            <div class="dropzone purple" id="bdropzone">
+              <div class="big">📢</div>
+              <b>拖拽文件到这里，或点击选择</b>
+              <small id="bdrop-small">房间内所有成员都能看到并下载</small>
+            </div>
+            <input type="file" id="bfile-input" multiple class="hidden">
+          </div>
+        </div>
+      </section>
+
+      <section class="hidden" id="upload-progress">
+        <div class="section-head">
+          <h2>上传记录 <span class="upload-total" id="upload-total"></span></h2>
+          <button class="link-btn" id="clear-sends" style="font-size:13px">清除已完成</button>
+        </div>
+        <div class="card">
+          <ul class="sends" id="send-list"></ul>
+          <ul class="sends" id="bsend-list"></ul>
+        </div>
+      </section>
+    </div>
+
+    <div class="col">
+      <section aria-label="文件删除管理">
+        <div class="section-head"><h2>文件</h2><span class="hint">中转保留 1 小时</span></div>
+        <div class="card">
+          <div class="file-toolbar">
+            <label><input type="checkbox" id="select-all-files" aria-label="选择全部可删除文件">全选可删除</label>
+            <button class="btn destructive" id="delete-selected" disabled>删除所选（0）</button>
+          </div>
+          <div class="sub-head">收到的文件<span>私发与房间共享</span></div>
+          <ul class="ios-list" id="inbox-list"><li class="ios-row empty">暂无文件</li></ul>
+          <div class="sub-head split">我发出的房间共享<span>退出房间后仍可删除</span></div>
+          <ul class="ios-list" id="outbox-list"><li class="ios-row empty">暂无自己发出的房间共享</li></ul>
+        </div>
+        <div id="delete-result" role="status" aria-live="polite" class="file-result"></div>
+      </section>
     </div>
   </div>
 
-  <div id="connection-status" role="status" style="font-size:13px;margin:8px 4px">正在连接…</div>
-  <div id="identity-notice" role="alert" class="hidden" style="font-size:13px;color:var(--red);margin:8px 4px"></div>
-  <div id="limits-summary" style="font-size:12px;color:var(--secondary);margin:0 4px 16px"></div>
-
-  <section class="section">
-    <div class="section-head"><h2>域号（房间）</h2><span class="hint">同域号才能互相看到</span></div>
-    <div class="ios-list">
-      <div class="domain-row">
-        <input id="domain-input" maxlength="4" inputmode="numeric" pattern="[0-9]*" placeholder="4 位数字">
-        <button class="btn small" id="domain-join">加入</button>
-        <button class="btn ghost small hidden" id="domain-leave">退出域</button>
-        <div class="domain-status" id="domain-status"></div>
-      </div>
-    </div>
-  </section>
-
-  <section class="section">
-    <div class="section-head">
-      <h2 id="devices-title">在线设备</h2>
-      <span class="hint" id="devices-hint"></span>
-    </div>
-    <ul class="ios-list" id="device-list"><li class="ios-row empty">正在发现设备…</li></ul>
-  </section>
-
-  <section class="section hidden" id="session-panel">
-    <div class="section-head">
-      <h2 id="peer-name">发给 …</h2>
-      <button class="link-btn destructive" id="deselect-btn">取消</button>
-    </div>
-    <div class="dropzone" id="dropzone">
-      <div class="big">📤</div>
-      <b>拖拽文件到这里，或点击选择</b>
-      <small>一对一私发 · 多文件依次上传 · 支持大文件、中文文件名</small>
-    </div>
-    <input type="file" id="file-input" multiple class="hidden">
-  </section>
-
-  <section class="section hidden" id="broadcast-panel">
-    <div class="section-head"><h2>发给域内所有人</h2><span class="hint" id="broadcast-hint"></span></div>
-    <div class="dropzone" id="bdropzone">
-      <div class="big">📢</div>
-      <b>拖拽文件到这里，或点击选择</b>
-      <small id="bdrop-small">域内所有成员都能看到并下载</small>
-    </div>
-    <input type="file" id="bfile-input" multiple class="hidden">
-  </section>
-
-  <section class="section hidden" id="upload-progress">
-    <div class="section-head"><h2>上传记录</h2><span class="hint">已上传表示中转保存完成</span></div>
-    <ul class="sends" id="send-list"></ul>
-    <ul class="sends" id="bsend-list"></ul>
-  </section>
-
-  <section class="section" aria-label="文件删除管理">
-    <div class="section-head"><h2>文件管理</h2><span class="hint">管理中转副本</span></div>
-    <div class="file-toolbar">
-      <label><input type="checkbox" id="select-all-files" aria-label="选择全部可删除文件">全选可删除文件</label>
-      <button class="btn destructive small" id="delete-selected" disabled>删除所选（0）</button>
-    </div>
-    <div id="delete-result" role="status" aria-live="polite" class="file-result"></div>
-  </section>
-
-  <section class="section">
-    <div class="section-head"><h2>收到的文件</h2><span class="hint">私发与域共享</span></div>
-    <ul class="ios-list" id="inbox-list"><li class="ios-row empty">暂无文件</li></ul>
-  </section>
-  <section class="section">
-    <div class="section-head"><h2>我发出的域共享</h2><span class="hint">退出房间后仍可删除</span></div>
-    <ul class="ios-list" id="outbox-list"><li class="ios-row empty">暂无自己发出的域共享文件</li></ul>
-  </section>
+  <div class="footer">
+    <div id="limits-summary"></div>
+    <div>HTTP 明文传输，仅在可信网络中使用</div>
+  </div>
 </div>
 
 <script>
 (function () {
   localStorage.removeItem("lanfiles_device_id");
   var LS_DOMAIN = "lanfiles_domain";
+  var LS_NAME = "lanfiles_name";
+  var NAME_WORDS = __NAME_WORDS__;
   var me = { id: "", name: "", domain: localStorage.getItem(LS_DOMAIN) || "" };
   var selectedId = null;
   var devices = [];
@@ -1094,24 +1206,56 @@ button:disabled { opacity: .45; cursor: not-allowed; }
     if (n < 1073741824) return (n / 1048576).toFixed(1) + " MB";
     return (n / 1073741824).toFixed(2) + " GB";
   };
+  var fmtTime = function (s) {
+    s = Math.max(0, Math.round(s));
+    if (s >= 3600) return Math.floor(s / 3600) + " 小时 " + Math.floor(s % 3600 / 60) + " 分";
+    if (s >= 60) return Math.floor(s / 60) + " 分 " + (s % 60) + " 秒";
+    return s + " 秒";
+  };
   var AV_COLORS = ["#6366f1", "#8b5cf6", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#ec4899", "#14b8a6"];
   function avatarColor(name) {
     var h = 0, i;
     for (i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
     return AV_COLORS[h % AV_COLORS.length];
   }
+  function fileIcon(name) {
+    var ext = (String(name).split(".").pop() || "").toLowerCase();
+    if (/^(png|jpe?g|gif|webp|heic|bmp|svg|tiff?)$/.test(ext)) return "🖼️";
+    if (/^(mp4|mov|mkv|avi|webm|m4v|flv)$/.test(ext)) return "🎬";
+    if (/^(mp3|wav|flac|aac|m4a|ogg)$/.test(ext)) return "🎵";
+    if (/^(zip|rar|7z|tar|gz|bz2|xz|dmg|iso)$/.test(ext)) return "🗜️";
+    if (ext === "pdf") return "📕";
+    if (/^(xlsx?|csv|numbers)$/.test(ext)) return "📊";
+    if (/^(pptx?|key)$/.test(ext)) return "📽️";
+    if (/^(apk|exe|msi|pkg|app)$/.test(ext)) return "📦";
+    return "📄";
+  }
+  function savedName() {
+    try { var n = localStorage.getItem(LS_NAME) || ""; return n.length <= 80 ? n : ""; } catch (_) { return ""; }
+  }
+  function saveName(n) { try { localStorage.setItem(LS_NAME, n); } catch (_) {} }
+  function randomName() {
+    var pick = function (list) { return list[Math.floor(Math.random() * list.length)]; };
+    return pick(NAME_WORDS[0]) + pick(NAME_WORDS[1]);
+  }
+  function renderMe(name) {
+    var av = $("me-avatar");
+    av.textContent = (name || "?").charAt(0);
+    av.style.background = name ? avatarColor(name) : "var(--secondary)";
+  }
 
   var registration = null;
   var retryDelay = 1500;
   var pollTimer = null;
   var queue = [];
-  var sending = false;
+  var activeUploads = 0;
   var connected = false;
   var identityWasLost = false;
+  var nameSyncAt = 0;
 
   function status(message, error) {
     $("connection-status").textContent = message;
-    $("connection-status").style.color = error ? "var(--red)" : "var(--secondary)";
+    $("status-pill").className = "status-pill" + (error ? " err" : (connected ? " ok" : ""));
   }
   function api(path, options) {
     return fetch(path, Object.assign({ credentials: "same-origin" }, options || {}))
@@ -1122,12 +1266,15 @@ button:disabled { opacity: .45; cursor: not-allowed; }
         return data;
       });
   }
+  function showIdentityNotice() {
+    $("identity-notice").textContent = "已建立新身份；旧身份的私发文件无法自动恢复。";
+    $("identity-notice").classList.remove("hidden");
+  }
   function applyProfile(d) {
     if (me.id && me.id !== d.device_id) {
       identityGeneration++; fileRevision++; selectedFiles.clear(); deleteErrors.clear();
       inbox = []; outbox = [];
-      $("identity-notice").textContent = "已建立新身份；旧身份的私发文件无法自动恢复。";
-      $("identity-notice").classList.remove("hidden");
+      showIdentityNotice();
     }
     if ((me.id && me.id !== d.device_id) || me.domain !== (d.domain || "")) {
       selectedId = null;
@@ -1135,10 +1282,18 @@ button:disabled { opacity: .45; cursor: not-allowed; }
     }
     me.id = d.device_id; me.name = d.name; me.domain = d.domain || "";
     localStorage.setItem(LS_DOMAIN, me.domain);
-    if (document.activeElement !== $("my-name")) $("my-name").value = me.name;
+    // 名字以本浏览器保存的为准：新身份（Cookie 丢失、其他标签页重建）会被改回固定名字。
+    var fixed = savedName();
+    if (!fixed) saveName(me.name);
+    else if (fixed !== me.name && Date.now() - nameSyncAt > 10000) {
+      nameSyncAt = Date.now();
+      updateProfile({ name: fixed });
+    }
+    if (document.activeElement !== $("my-name")) { $("my-name").value = fixed || me.name; renderMe(fixed || me.name); }
     renderDomain();
     if (d.limits) {
       me.maxFileSize = d.limits.max_file_size;
+      me.uploadSlots = Math.max(1, d.limits.uploads_per_device || 1);
       $("limits-summary").textContent = "单文件上限 " + fmtSize(d.limits.max_file_size) +
         " · 中转总量 " + fmtSize(d.limits.spool_quota) + " · 文件保留 1 小时";
     }
@@ -1152,19 +1307,21 @@ button:disabled { opacity: .45; cursor: not-allowed; }
     renderDevices(); renderInbox();
   }
   function register(profile) {
-    if (registration) return registration;
+    if (registration) {
+      // 已有注册在途时，资料修改排在其后，避免被合并丢失。
+      if (!profile) return registration;
+      return registration.catch(function () {}).then(function () { return register(profile); });
+    }
     var hadIdentity = !!me.id;
     var body = profile || { domain: me.domain };
+    if (!profile && savedName()) body.name = savedName();
     var generation = identityGeneration;
     registration = api("/api/register", {
       method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body)
     }).then(function (d) {
       if (generation !== identityGeneration) return null;
       applyProfile(d);
-      if (d.new_identity && (hadIdentity || identityWasLost)) {
-        $("identity-notice").textContent = "已建立新身份；旧身份的私发文件无法自动恢复。";
-        $("identity-notice").classList.remove("hidden");
-      }
+      if (d.new_identity && (hadIdentity || identityWasLost)) showIdentityNotice();
       identityWasLost = false;
       return d;
     }).finally(function () { registration = null; });
@@ -1191,7 +1348,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
       if (revision === fileRevision) { inbox = lists[1].inbox; outbox = lists[1].outbox; }
       renderDevices(); renderInbox(); retryDelay = 1500; connected = true;
       drainQueue();
-      status("已连接 · 仅在可信网络中使用 HTTP 传输", false);
+      status("已连接", false);
     } catch (e) {
       if (requestGeneration !== identityGeneration) return schedulePoll(0);
       connected = false;
@@ -1205,7 +1362,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
           status(registrationError.message + "，稍后重试", true);
         }
       } else {
-        status("连接中断或请求失败：" + e.message + "，正在重试…", true);
+        status("连接中断：" + e.message + "，正在重试…", true);
       }
       retryDelay = Math.min(retryDelay * 2, 15000);
     }
@@ -1219,17 +1376,22 @@ button:disabled { opacity: .45; cursor: not-allowed; }
     var join = $("domain-join");
     var bp = $("broadcast-panel");
     if (me.domain) {
-      st.innerHTML = '已加入域 <b>#' + esc(me.domain) + '</b> · 仅同域设备可见';
-      join.textContent = "改域";
+      st.innerHTML = '已加入房间 <b>#' + esc(me.domain) + '</b> · 仅同房间设备可见';
+      join.textContent = "更换";
       leave.classList.remove("hidden");
       bp.classList.remove("hidden");
-      $("broadcast-hint").textContent = "域 #" + me.domain;
+      $("broadcast-hint").textContent = "房间 #" + me.domain;
     } else {
-      st.innerHTML = '未加入域 · <span class="pill">公开模式</span>';
+      st.innerHTML = '未加入房间 <span class="pill">公开模式</span>';
       join.textContent = "加入";
       leave.classList.add("hidden");
       bp.classList.add("hidden");
     }
+    renderSendHint();
+  }
+  function renderSendHint() {
+    var idle = !selectedId && !me.domain;
+    $("send-hint").classList.toggle("hidden", !idle);
   }
 
   function renderDevices() {
@@ -1237,18 +1399,15 @@ button:disabled { opacity: .45; cursor: not-allowed; }
     var title = $("devices-title");
     var hint = $("devices-hint");
     ul.innerHTML = "";
-    if (me.domain) {
-      title.textContent = "域内设备";
-      hint.textContent = "域 #" + me.domain + " · " + devices.length + " 人";
-    } else {
-      title.textContent = "在线设备";
-      hint.textContent = "公开模式";
-    }
+    var online = devices.filter(function (d) { return d.online; }).length;
+    title.textContent = me.domain ? "房间内设备" : "在线设备";
+    hint.textContent = (me.domain ? "房间 #" + me.domain + " · " : "公开模式 · ") + online + " 台在线";
     if (!devices.length) {
-      ul.innerHTML = '<li class="ios-row empty">还没有其他设备上线</li>';
+      ul.innerHTML = '<li class="ios-row empty">还没有其他设备上线 · 在其他设备打开本页面</li>';
+      renderSendHint();
       return;
     }
-    devices.forEach(function (d) {
+    devices.slice().sort(function (x, y) { return (y.online - x.online) || x.name.localeCompare(y.name); }).forEach(function (d) {
       var li = document.createElement("li");
       li.className = "ios-row device" + (d.online ? "" : " offline") + (d.id === selectedId ? " selected" : "");
       var av = document.createElement("div");
@@ -1265,11 +1424,11 @@ button:disabled { opacity: .45; cursor: not-allowed; }
       dn.textContent = d.name;
       var ds = document.createElement("div");
       ds.className = "dsub";
-      ds.textContent = d.online ? "在线" : "离线";
+      ds.textContent = d.online ? (d.id === selectedId ? "已选择 · 在下方发送文件" : "在线 · 点击选择") : "离线";
       meta.appendChild(dn); meta.appendChild(ds);
       var check = document.createElement("span");
       check.className = "check";
-      check.textContent = "✓";
+      check.textContent = d.id === selectedId ? "✓" : "";
       li.appendChild(av); li.appendChild(meta); li.appendChild(check);
       if (d.online) li.onclick = function () { selectDevice(d.id, d.name); };
       ul.appendChild(li);
@@ -1278,6 +1437,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
       var still = devices.some(function (d) { return d.id === selectedId && d.online; });
       if (!still) closeSession();
     }
+    renderSendHint();
   }
 
   function deletableFiles() {
@@ -1300,10 +1460,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
     ul.innerHTML = "";
     if (!items.length) {
       var empty = document.createElement("li"); empty.className = "ios-row empty";
-      empty.textContent = ownBroadcast ? "暂无自己发出的域共享文件" : "暂无文件";
+      empty.textContent = ownBroadcast ? "暂无自己发出的房间共享" : "暂无文件";
       ul.appendChild(empty); return;
     }
-    items.forEach(function (t) {
+    items.slice().reverse().forEach(function (t) {
       var pending = t.state === "deleting";
       var li = document.createElement("li");
       li.className = "ios-row file-item" + (ownBroadcast ? " outbox-item" : " inbox-item");
@@ -1318,14 +1478,15 @@ button:disabled { opacity: .45; cursor: not-allowed; }
         };
         li.appendChild(checkbox);
       }
-      var icon = document.createElement("div"); icon.className = "ficon"; icon.textContent = "📄";
+      var icon = document.createElement("div"); icon.className = "ficon"; icon.textContent = fileIcon(t.filename);
       var meta = document.createElement("div"); meta.className = "fmeta";
       var name = document.createElement("div"); name.className = "fname"; name.textContent = t.filename; name.title = t.filename;
       var sub = document.createElement("div"); sub.className = "fsub";
-      var tag = document.createElement("span"); tag.className = "tag " + (t.kind === "domain" ? "domain" : "direct");
-      tag.textContent = pending ? "等待删除" : (t.kind === "domain" ? "域共享" : "私发");
+      var tag = document.createElement("span");
+      tag.className = "tag " + (pending ? "pending" : (t.kind === "domain" ? "domain" : "direct"));
+      tag.textContent = pending ? "等待删除" : (t.kind === "domain" ? "房间共享" : "私发");
       var info = document.createElement("span");
-      info.textContent = (ownBroadcast ? "房间 #" + t.domain : t.from_name) + " · " + fmtSize(t.size);
+      info.textContent = (ownBroadcast ? "房间 #" + t.domain : "来自 " + t.from_name) + " · " + fmtSize(t.size);
       sub.appendChild(tag); sub.appendChild(info);
       meta.appendChild(name); meta.appendChild(sub);
       if (pending) {
@@ -1424,7 +1585,7 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   function selectDevice(id, name) {
     if (id === selectedId) { closeSession(); return; }
     selectedId = id;
-    $("peer-name").textContent = "发给 · " + name;
+    $("peer-name").textContent = "发给 " + name;
     $("session-panel").classList.remove("hidden");
     renderDevices();
   }
@@ -1434,45 +1595,77 @@ button:disabled { opacity: .45; cursor: not-allowed; }
     renderDevices();
   }
 
+  // ---- 上传：按服务器给的每设备并发数并行，显示速度与剩余时间 ----
+  var uploading = new Set();
+  function renderUploadTotal() {
+    var speed = 0;
+    uploading.forEach(function (u) { speed += u.speed || 0; });
+    $("upload-total").textContent = uploading.size ? "· " + uploading.size + " 个进行中 · " + fmtSize(speed) + "/s" : (queue.length ? "· " + queue.length + " 个排队" : "");
+  }
   function sendFiles(files, listId, urlFn) {
     if (files.length) $("upload-progress").classList.remove("hidden");
     for (var i = 0; i < files.length; i++) {
       var file = files[i];
       var li = document.createElement("li");
       li.className = "send-item";
-      li.innerHTML = '<span class="nm"></span><span class="bar"><i></i></span><span class="st">排队中</span>';
+      li.innerHTML = '<span class="nm"></span><span class="st">排队中</span><span class="bar"><i></i></span><span class="sp"></span>';
       li.querySelector(".nm").textContent = file.name;
+      li.querySelector(".sp").textContent = fmtSize(file.size);
       $(listId).appendChild(li);
       // 入队时固定目标和房间，之后切换设备不会改变这些文件的去向。
       queue.push({ file: file, url: urlFn(file), li: li });
     }
+    renderUploadTotal();
     drainQueue();
   }
-  async function drainQueue() {
-    if (sending) return;
-    sending = true;
-    try {
-      while (queue.length && connected) await sendOne(queue.shift());
-    } finally { sending = false; }
+  function drainQueue() {
+    while (connected && queue.length && activeUploads < (me.uploadSlots || 1)) {
+      activeUploads++;
+      sendOne(queue.shift()).then(function () { activeUploads--; renderUploadTotal(); drainQueue(); });
+    }
   }
   function sendOne(item) {
     return new Promise(function (resolve) {
       var file = item.file, li = item.li;
-      var fill = li.querySelector(".bar > i"), st = li.querySelector(".st");
+      var fill = li.querySelector(".bar > i"), st = li.querySelector(".st"), sp = li.querySelector(".sp");
       var xhr = new XMLHttpRequest();
       var finished = false;
+      var track = { speed: 0, loaded: 0, at: performance.now(), start: performance.now() };
       function finish(error) {
         if (finished) return;
         finished = true;
-        if (error) { st.textContent = "失败：" + error; st.className = "st err"; st.style.width = "auto"; st.style.maxWidth = "50%"; li.title = error; status(file.name + "：" + error, true); }
-        else { fill.style.width = "100%"; st.textContent = "已上传"; st.className = "st ok"; li.title = "已上传到中转，等待收件人下载"; }
+        uploading.delete(track);
+        var secs = (performance.now() - track.start) / 1000;
+        if (error) { st.textContent = "失败：" + error; st.className = "st err"; li.classList.add("failed"); li.title = error; sp.textContent = fmtSize(file.size); status(file.name + "：" + error, true); }
+        else {
+          fill.style.width = "100%"; st.textContent = "已上传"; st.className = "st ok"; li.classList.add("done");
+          li.title = "已上传到中转，等待收件人下载";
+          sp.textContent = fmtSize(file.size) + (secs > 0.5 ? " · 平均 " + fmtSize(file.size / secs) + "/s · 用时 " + fmtTime(secs) : "");
+        }
+        renderUploadTotal();
         resolve();
       }
       if (me.maxFileSize !== undefined && file.size > me.maxFileSize) { finish("文件超过单文件上限"); return; }
       st.textContent = "上传中";
+      uploading.add(track);
+      renderUploadTotal();
       xhr.open("POST", item.url); xhr.withCredentials = true;
       xhr.timeout = 6 * 3600 * 1000 + 30000;
-      xhr.upload.onprogress = function (e) { if (e.lengthComputable) fill.style.width = (e.loaded / e.total * 100) + "%"; };
+      xhr.upload.onprogress = function (e) {
+        if (!e.lengthComputable) return;
+        var now = performance.now(), dt = (now - track.at) / 1000;
+        if (dt >= 0.4) {
+          var inst = (e.loaded - track.loaded) / dt;
+          track.speed = track.speed ? track.speed * 0.6 + inst * 0.4 : inst;
+          track.loaded = e.loaded; track.at = now;
+          var left = track.speed > 0 ? (e.total - e.loaded) / track.speed : 0;
+          sp.textContent = fmtSize(e.loaded) + " / " + fmtSize(e.total) + " · " + fmtSize(track.speed) + "/s" + (left >= 1 ? " · 剩余 " + fmtTime(left) : "");
+          renderUploadTotal();
+        }
+        fill.style.width = (e.loaded / e.total * 100) + "%";
+        st.textContent = Math.floor(e.loaded / e.total * 100) + "%";
+        if (e.loaded === e.total) st.textContent = "保存中…";
+      };
       xhr.onload = function () {
         var d = {};
         try { d = JSON.parse(xhr.responseText); } catch (_) {}
@@ -1488,6 +1681,10 @@ button:disabled { opacity: .45; cursor: not-allowed; }
       xhr.send(file);
     });
   }
+  $("clear-sends").onclick = function () {
+    document.querySelectorAll(".send-item.done").forEach(function (li) { li.remove(); });
+    if (!document.querySelector(".send-item")) $("upload-progress").classList.add("hidden");
+  };
 
   function directUrl(file) {
     return "/api/send?to=" + encodeURIComponent(selectedId) + "&name=" + encodeURIComponent(file.name);
@@ -1520,22 +1717,29 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   }
 
   function updateProfile(profile) {
-    register(profile).then(function () { schedulePoll(0); }).catch(function (e) {
+    return register(profile).then(function () { schedulePoll(0); }).catch(function (e) {
       status("更新失败：" + e.message, true);
       renderDomain();
       if (e.status === 401) { clearStale(); schedulePoll(0); }
     });
   }
-  $("my-name").addEventListener("change", function () {
-    var v = this.value.trim();
-    if (!v || v.length > 80) { this.value = me.name; status("名称需为 1 至 80 字符", true); return; }
-    updateProfile({ name: v });
-  });
+  function setName(v) {
+    v = v.trim();
+    if (!v || v.length > 80 || /[\x00-\x1f]/.test(v)) { $("my-name").value = savedName() || me.name; status("名称需为 1 至 80 个字符", true); return; }
+    $("my-name").value = v;
+    saveName(v); renderMe(v);
+    if (v !== me.name) updateProfile({ name: v });
+  }
+  $("my-name").addEventListener("change", function () { setName(this.value); });
+  $("my-name").addEventListener("input", function () { renderMe(this.value.trim()); });
+  $("my-name").addEventListener("keydown", function (e) { if (e.key === "Enter") this.blur(); });
+  $("name-dice").addEventListener("click", function () { setName(randomName()); });
   $("domain-join").addEventListener("click", function () {
     var v = $("domain-input").value.trim();
-    if (v && !/^[0-9]{4}$/.test(v)) { status("域号需为 4 位数字", true); return; }
+    if (v && !/^[0-9]{4}$/.test(v)) { status("房间号需为 4 位数字", true); return; }
     closeSession(); updateProfile({ domain: v });
   });
+  $("domain-input").addEventListener("keydown", function (e) { if (e.key === "Enter") $("domain-join").click(); });
   $("domain-leave").addEventListener("click", function () {
     closeSession(); updateProfile({ domain: "" });
   });
@@ -1544,11 +1748,15 @@ button:disabled { opacity: .45; cursor: not-allowed; }
   setupDrop("dropzone", "file-input", "send-list", directUrl, true);
   setupDrop("bdropzone", "bfile-input", "bsend-list", broadcastUrl, false);
 
+  renderMe(savedName());
+  if (savedName()) $("my-name").value = savedName();
   poll();
 })();
 </script>
 </body>
 </html>"""
+# 前端“随机名字”按钮与服务端使用同一组词。
+INDEX_HTML = INDEX_HTML.replace("__NAME_WORDS__", json.dumps([ADJECTIVES, NOUNS], ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
@@ -1684,9 +1892,9 @@ def main():
     legacy = [name for name in os.listdir(SPOOL_DIR) if ID_RE.fullmatch(name)]
     if legacy:
         print("提示：发现 %d 个旧版遗留文件，原位保留，请手动处理；无法自动恢复旧收件人。" % len(legacy), flush=True)
-    print("容量限制：单文件 %d MiB / 中转总量 %d MiB / 同时上传 %d / 保留空闲 %d MiB" % (
+    print("容量限制：单文件 %d MiB / 中转总量 %d MiB / 同时上传 %d（每设备 %d） / 保留空闲 %d MiB" % (
         limits.max_file_size // 1024**2, limits.spool_quota // 1024**2,
-        limits.max_uploads, limits.min_free_space // 1024**2), flush=True)
+        limits.max_uploads, limits.uploads_per_device, limits.min_free_space // 1024**2), flush=True)
     primary, others = local_ipv4() if args.host == "0.0.0.0" else (args.host, [])
 
     if sys.platform.startswith("win"):
