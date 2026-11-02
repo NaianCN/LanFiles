@@ -287,6 +287,28 @@ class Store:
                     for row in self.db.execute("SELECT * FROM devices WHERE domain=? AND id<>? AND expires>?",
                                                (dev["domain"], did, now))]
 
+    def all_devices(self):
+        """本机管理视图：所有房间的有效设备。"""
+        with self._lock:
+            now = time.time()
+            return [{"id": row["id"], "name": row["name"], "domain": row["domain"], "addr": row["addr"],
+                     "online": now - self._seen.get(row["id"], row["last_seen"]) <= OFFLINE_TTL}
+                    for row in self.db.execute("SELECT * FROM devices WHERE expires>? ORDER BY created", (now,))]
+
+    def delete_device(self, did):
+        """注销设备身份并清理发给它的私发文件；在线设备会以新身份自动重连。"""
+        with self._lock:
+            if not self._device(did):
+                raise APIError(404, "设备不存在")
+            for row in list(self.db.execute(
+                    "SELECT transfer_id FROM transfers WHERE target=? AND state='ready'", (did,))):
+                self._mark_delete(row[0])
+                self._delete(row[0])
+            with self.db:
+                self.db.execute("DELETE FROM devices WHERE id=?", (did,))
+            self._seen.pop(did, None)
+            return {"ok": True}
+
     def _used(self):
         return self.db.execute("SELECT COALESCE(SUM(CASE WHEN state='uploading' THEN expected ELSE size END),0) FROM transfers").fetchone()[0]
 
@@ -521,6 +543,14 @@ class Store:
             return {"ok": True, "pending": not deleted}
 
 
+def log_transfer(action, filename, size, who, seconds):
+    """传输动态只写文件名、设备名、大小和速度，不含 Cookie 或请求 URL。"""
+    mb = size / 1e6
+    speed = " · %.1f MB/s" % (mb / seconds) if seconds >= 0.05 else ""
+    print("[%s] %s %s（%.1f MB）%s · %.1f 秒%s" % (
+        time.strftime("%H:%M:%S"), action, filename, mb, who, seconds, speed), flush=True)
+
+
 def random_name():
     return "%s%s" % (secrets.choice(ADJECTIVES), secrets.choice(NOUNS))
 
@@ -542,6 +572,8 @@ class LanFilesServer(ThreadingHTTPServer):
         self._connections = set()
         self._connections_lock = threading.Lock()
         self._cleanup_thread = None
+        # 只有本机（回环或本机网卡地址）发起的请求可以管理设备。
+        self.admin_addrs = _collect_ips() | {"127.0.0.1", "::1"}
         try:
             super().__init__(address, Handler)
         except Exception:
@@ -730,6 +762,14 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(204, b"")
             if method == "POST" and path == "/api/register":
                 return self._api_register()
+            if path.startswith("/api/admin/"):
+                if not self._is_admin():
+                    raise APIError(403, "仅限运行服务的电脑管理设备")
+                if method == "GET" and path == "/api/admin/devices":
+                    return self._json(self.store.all_devices())
+                if method == "POST" and path.startswith("/api/admin/delete-device/"):
+                    return self._json(self.store.delete_device(path[len("/api/admin/delete-device/"):]))
+                raise APIError(404, "未找到该路径")
             dev = self._identity(qs)
             if method == "GET" and path == "/api/session":
                 return self._json(self._profile(dev))
@@ -795,8 +835,12 @@ class Handler(BaseHTTPRequestHandler):
             extra["Set-Cookie"] = "%s=%s; Max-Age=%d; HttpOnly; SameSite=Strict; Path=/" % (self.store.cookie_name, token, SESSION_TTL)
         self._json(dict(self._profile(dev), new_identity=bool(token)), extra=extra)
 
+    def _is_admin(self):
+        return self.client_address[0] in self.server.admin_addrs
+
     def _profile(self, dev):
         return {"device_id": dev["id"], "name": dev["name"], "domain": dev["domain"],
+                "admin": self._is_admin(),
                 "limits": {"max_file_size": self.store.limits.max_file_size,
                            "spool_quota": self.store.limits.spool_quota,
                            "max_uploads": self.store.limits.max_uploads,
@@ -808,7 +852,8 @@ class Handler(BaseHTTPRequestHandler):
                                       qs.get("domain", [""])[0],
                                       sanitize_filename(qs.get("name", [""])[0]), total)
         complete = False
-        deadline = time.monotonic() + self.store.limits.upload_timeout
+        started = time.monotonic()
+        deadline = started + self.store.limits.upload_timeout
         try:
             path = self.store.file_path(tid, True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
@@ -834,6 +879,11 @@ class Handler(BaseHTTPRequestHandler):
             result = self.store.finish_upload(tid)
             complete = True
             self._json(result)
+            to = qs.get("to", [""])[0]
+            receiver = self.store.all_devices() if to else []
+            target = next((d["name"] for d in receiver if d["id"] == to), "?") if to else "房间 #" + dev["domain"]
+            log_transfer("上传", result["filename"], result["size"], "%s → %s" % (dev["name"], target),
+                         time.monotonic() - started)
         except OSError:
             raise APIError(507, "文件写入失败，未投递")
         finally:
@@ -854,8 +904,10 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.send_header("X-Content-Type-Options", "nosniff")
             self.end_headers()
+            started = time.monotonic()
             # sendfile 走内核零拷贝；不支持的平台（如 Windows）自动退回普通 send。
             self.connection.sendfile(file)
+            log_transfer("下载", row["filename"], row["size"], "→ " + dev["name"], time.monotonic() - started)
         finally:
             file.close()
             self.store.release_download(tid)
@@ -940,6 +992,9 @@ body {
 .section-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 6px; margin: 0 0 8px; min-height: 22px; }
 .section-head h2 { font-size: 13px; font-weight: 600; color: var(--header); margin: 0; letter-spacing: .3px; }
 .section-head .hint { font-size: 12px; color: var(--secondary); text-align: right; }
+.section-head.collapsible { cursor: pointer; user-select: none; }
+.caret { display: inline-block; width: 14px; color: var(--secondary); }
+.dev-del { color: var(--red); font-size: 13px; padding: 6px 4px; flex: none; }
 
 /* 我的身份 + 房间 */
 .me-row { display: flex; align-items: center; gap: 12px; padding: 14px 16px; }
@@ -972,7 +1027,8 @@ body {
 /* 设备 */
 .device { cursor: pointer; transition: background .15s ease; }
 .device:hover { background: var(--fill); }
-.device.offline { opacity: .45; cursor: not-allowed; }
+.device.offline { cursor: default; }
+.device.offline .avatar, .device.offline .dmeta, .device.offline .check { opacity: .45; }
 .device.offline:hover { background: none; }
 .device.selected, .device.selected:hover { background: var(--accent-soft); }
 .device.selected .dname { color: var(--accent); }
@@ -1084,7 +1140,7 @@ a.dl:active { opacity: .6; }
   <div class="layout">
     <div class="col">
       <section>
-        <div class="section-head"><h2>我的设备</h2><span class="hint">名字保存在本浏览器，下次打开自动使用</span></div>
+        <div class="section-head"><h2>我的设备</h2></div>
         <div class="card">
           <div class="me-row">
             <div class="avatar lg" id="me-avatar">?</div>
@@ -1108,14 +1164,16 @@ a.dl:active { opacity: .6; }
       </section>
 
       <section>
-        <div class="section-head"><h2 id="devices-title">在线设备</h2><span class="hint" id="devices-hint"></span></div>
-        <div class="card"><ul class="ios-list" id="device-list"><li class="ios-row empty">正在发现设备…</li></ul></div>
+        <div class="section-head collapsible" id="devices-head" role="button" tabindex="0" aria-expanded="true">
+          <h2><span class="caret" id="devices-caret">▾</span><span id="devices-title">在线设备</span></h2><span class="hint" id="devices-hint"></span>
+        </div>
+        <div class="card" id="devices-card"><ul class="ios-list" id="device-list"><li class="ios-row empty">正在发现设备…</li></ul></div>
       </section>
 
       <section>
-        <div class="section-head"><h2>发送</h2><span class="hint">可多选文件，自动并行上传</span></div>
+        <div class="section-head"><h2>发送</h2></div>
         <div class="card">
-          <div class="send-hint" id="send-hint">点上方的设备即可私发文件<br>加入房间后还可以发给房间内所有人</div>
+          <div class="send-hint" id="send-hint">选择设备后发送文件</div>
           <div class="send-card hidden" id="session-panel">
             <div class="send-head">
               <h3 id="peer-name">发给 …</h3>
@@ -1124,7 +1182,6 @@ a.dl:active { opacity: .6; }
             <div class="dropzone" id="dropzone">
               <div class="big">📤</div>
               <b>拖拽文件到这里，或点击选择</b>
-              <small>一对一私发 · 支持大文件、中文文件名</small>
             </div>
             <input type="file" id="file-input" multiple class="hidden">
           </div>
@@ -1133,7 +1190,6 @@ a.dl:active { opacity: .6; }
             <div class="dropzone purple" id="bdropzone">
               <div class="big">📢</div>
               <b>拖拽文件到这里，或点击选择</b>
-              <small id="bdrop-small">房间内所有成员都能看到并下载</small>
             </div>
             <input type="file" id="bfile-input" multiple class="hidden">
           </div>
@@ -1154,15 +1210,15 @@ a.dl:active { opacity: .6; }
 
     <div class="col">
       <section aria-label="文件删除管理">
-        <div class="section-head"><h2>文件</h2><span class="hint">中转保留 1 小时</span></div>
+        <div class="section-head"><h2>文件</h2></div>
         <div class="card">
           <div class="file-toolbar">
             <label><input type="checkbox" id="select-all-files" aria-label="选择全部可删除文件">全选可删除</label>
             <button class="btn destructive" id="delete-selected" disabled>删除所选（0）</button>
           </div>
-          <div class="sub-head">收到的文件<span>私发与房间共享</span></div>
+          <div class="sub-head">收到的文件</div>
           <ul class="ios-list" id="inbox-list"><li class="ios-row empty">暂无文件</li></ul>
-          <div class="sub-head split">我发出的房间共享<span>退出房间后仍可删除</span></div>
+          <div class="sub-head split">我发出的房间共享</div>
           <ul class="ios-list" id="outbox-list"><li class="ios-row empty">暂无自己发出的房间共享</li></ul>
         </div>
         <div id="delete-result" role="status" aria-live="polite" class="file-result"></div>
@@ -1172,7 +1228,6 @@ a.dl:active { opacity: .6; }
 
   <div class="footer">
     <div id="limits-summary"></div>
-    <div>HTTP 明文传输，仅在可信网络中使用</div>
   </div>
 </div>
 
@@ -1280,7 +1335,7 @@ a.dl:active { opacity: .6; }
       selectedId = null;
       $("session-panel").classList.add("hidden");
     }
-    me.id = d.device_id; me.name = d.name; me.domain = d.domain || "";
+    me.id = d.device_id; me.name = d.name; me.domain = d.domain || ""; me.admin = !!d.admin;
     localStorage.setItem(LS_DOMAIN, me.domain);
     // 名字以本浏览器保存的为准：新身份（Cookie 丢失、其他标签页重建）会被改回固定名字。
     var fixed = savedName();
@@ -1295,7 +1350,7 @@ a.dl:active { opacity: .6; }
       me.maxFileSize = d.limits.max_file_size;
       me.uploadSlots = Math.max(1, d.limits.uploads_per_device || 1);
       $("limits-summary").textContent = "单文件上限 " + fmtSize(d.limits.max_file_size) +
-        " · 中转总量 " + fmtSize(d.limits.spool_quota) + " · 文件保留 1 小时";
+        " · 文件保留 1 小时";
     }
   }
   function clearStale() {
@@ -1376,13 +1431,13 @@ a.dl:active { opacity: .6; }
     var join = $("domain-join");
     var bp = $("broadcast-panel");
     if (me.domain) {
-      st.innerHTML = '已加入房间 <b>#' + esc(me.domain) + '</b> · 仅同房间设备可见';
+      st.innerHTML = '已加入 <b>#' + esc(me.domain) + '</b>';
       join.textContent = "更换";
       leave.classList.remove("hidden");
       bp.classList.remove("hidden");
       $("broadcast-hint").textContent = "房间 #" + me.domain;
     } else {
-      st.innerHTML = '未加入房间 <span class="pill">公开模式</span>';
+      st.textContent = "未加入房间";
       join.textContent = "加入";
       leave.classList.add("hidden");
       bp.classList.add("hidden");
@@ -1401,9 +1456,9 @@ a.dl:active { opacity: .6; }
     ul.innerHTML = "";
     var online = devices.filter(function (d) { return d.online; }).length;
     title.textContent = me.domain ? "房间内设备" : "在线设备";
-    hint.textContent = (me.domain ? "房间 #" + me.domain + " · " : "公开模式 · ") + online + " 台在线";
+    hint.textContent = online + " 台在线";
     if (!devices.length) {
-      ul.innerHTML = '<li class="ios-row empty">还没有其他设备上线 · 在其他设备打开本页面</li>';
+      ul.innerHTML = '<li class="ios-row empty">暂无其他设备</li>';
       renderSendHint();
       return;
     }
@@ -1424,12 +1479,19 @@ a.dl:active { opacity: .6; }
       dn.textContent = d.name;
       var ds = document.createElement("div");
       ds.className = "dsub";
-      ds.textContent = d.online ? (d.id === selectedId ? "已选择 · 在下方发送文件" : "在线 · 点击选择") : "离线";
+      ds.textContent = d.online ? (d.id === selectedId ? "已选择" : "在线") : "离线";
       meta.appendChild(dn); meta.appendChild(ds);
       var check = document.createElement("span");
       check.className = "check";
       check.textContent = d.id === selectedId ? "✓" : "";
-      li.appendChild(av); li.appendChild(meta); li.appendChild(check);
+      li.appendChild(av); li.appendChild(meta);
+      if (me.admin) {
+        var del = document.createElement("button");
+        del.className = "dev-del"; del.textContent = "删除"; del.setAttribute("aria-label", "删除设备 " + d.name);
+        del.onclick = function (e) { e.stopPropagation(); deleteDevice(d); };
+        li.appendChild(del);
+      }
+      li.appendChild(check);
       if (d.online) li.onclick = function () { selectDevice(d.id, d.name); };
       ul.appendChild(li);
     });
@@ -1438,6 +1500,15 @@ a.dl:active { opacity: .6; }
       if (!still) closeSession();
     }
     renderSendHint();
+  }
+
+  function deleteDevice(d) {
+    var note = d.online ? "\n该设备在线，删除后会以新身份重新连接。" : "";
+    if (!window.confirm("删除设备“" + d.name + "”？发给它的未下载私发文件也会删除。" + note)) return;
+    api("/api/admin/delete-device/" + encodeURIComponent(d.id), { method: "POST" }).then(function () {
+      if (selectedId === d.id) closeSession();
+      schedulePoll(0);
+    }).catch(function (e) { status("删除设备失败：" + e.message, true); });
   }
 
   function deletableFiles() {
@@ -1744,6 +1815,15 @@ a.dl:active { opacity: .6; }
     closeSession(); updateProfile({ domain: "" });
   });
   $("deselect-btn").addEventListener("click", closeSession);
+  function setDevicesCollapsed(collapsed) {
+    $("devices-card").classList.toggle("hidden", collapsed);
+    $("devices-caret").textContent = collapsed ? "▸" : "▾";
+    $("devices-head").setAttribute("aria-expanded", String(!collapsed));
+    try { localStorage.setItem("lanfiles_devices_collapsed", collapsed ? "1" : ""); } catch (_) {}
+  }
+  $("devices-head").addEventListener("click", function () { setDevicesCollapsed(!$("devices-card").classList.contains("hidden")); });
+  $("devices-head").addEventListener("keydown", function (e) { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); this.click(); } });
+  try { setDevicesCollapsed(localStorage.getItem("lanfiles_devices_collapsed") === "1"); } catch (_) {}
 
   setupDrop("dropzone", "file-input", "send-list", directUrl, true);
   setupDrop("bdropzone", "bfile-input", "bsend-list", broadcastUrl, false);
@@ -1897,31 +1977,18 @@ def main():
         limits.max_uploads, limits.uploads_per_device, limits.min_free_space // 1024**2), flush=True)
     primary, others = local_ipv4() if args.host == "0.0.0.0" else (args.host, [])
 
-    if sys.platform.startswith("win"):
-        fw_hint = "    ④ Windows 首次运行若弹防火墙提示，勾选「专用网络」并点「允许访问」"
-    elif sys.platform == "darwin":
-        fw_hint = "    ④ macOS 若弹防火墙提示，选择「允许」Python 接受传入连接"
-    else:
-        fw_hint = "    ④ 若系统防火墙拦截，请允许本程序接受传入连接"
+    fw_hint = "防火墙允许本程序（Windows 勾选专用网络）"
 
     lines = ["=" * 60,
              "  局域网传文件已启动",
-             "  请在其他设备的浏览器打开（注意用 http:// 开头）：",
+             "  在其他设备的浏览器打开：",
              "    ★ http://%s:%d" % (primary, args.port)]
     if others:
-        lines.append("  本机 / 备用地址：")
+        lines.append("  备用地址：")
         for ip in others:
             lines.append("    http://%s:%d" % (ip, args.port))
-        lines.append("  （若 ★ 连不上，改用与你设备同网段的备用地址；172.x 且以 .1 结尾的多为虚拟机/WSL 网卡，不是局域网地址。）")
     lines += ["  中转目录：%s" % SPOOL_DIR,
-              "  按 Ctrl+C 退出",
-              "-" * 60,
-              "  提示：其他设备连不上时，先确认本程序仍在运行（此窗口保持打开、不要 Ctrl+C）。",
-              "  连不上？逐条排查：",
-              "    ① 设备与电脑连同一个路由器/网段（网段需一致，如 192.168.5.x）",
-              "    ② 用 http:// 开头，不要用 https://",
-              "    ③ 路由器关闭「AP/客户端/无线隔离」",
-              fw_hint,
+              "  连不上：确认同一网段、用 http://、" + fw_hint,
               "=" * 60]
     print("\n".join(lines), flush=True)
     def request_stop(signum, frame):

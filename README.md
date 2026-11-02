@@ -1,6 +1,6 @@
 # 局域网传文件（LanFiles）
 
-当前版本：**1.3.0** · 作者：**GPT、Gemini** · 项目维护：**NaianCN**
+当前版本：**1.4.0** · 作者：**GPT、Gemini** · 项目维护：**NaianCN**
 
 [Windows 免安装包](https://raw.githubusercontent.com/NaianCN/LanFiles/main/lanfiles-win.zip) · [macOS 应用包](https://raw.githubusercontent.com/NaianCN/LanFiles/main/lanfiles-macos.zip) · [更新记录](CHANGELOG.md)
 
@@ -70,6 +70,13 @@ Windows 免安装包为 `lanfiles-win.zip`，解压后运行 `start.bat`；其 P
 - 首次升级发现旧版根目录中的 UUID 文件时，只提示并原位保留。旧版没有保存收件人，无法自动恢复归属；需要用户手动处理。
 - 升级和回滚前备份所用版本及 `.lanfiles` 数据。1.1.0 与 1.2.0 的数据库格式相同；更早的内存登记版本不能读取新版状态，且仍存在旧风险。不要同时运行两个版本。
 
+## 设备管理与传输日志
+
+- 在运行服务的电脑上（桌面版，或本机浏览器访问网页）可以看到所有设备并删除。判断依据是请求来源为回环地址或本机网卡地址，其他设备看不到删除按钮，调用管理接口返回 `403`。
+- 删除设备会注销其身份，并清理发给它、尚未下载的私发文件；该设备发出的房间共享保留到过期。在线设备被删除后会以新身份自动重连（名字按 IP 恢复）。
+- 设备列表可折叠，网页会记住折叠状态。
+- 服务输出（终端或桌面版“日志”）会记录每次上传、下载完成的文件名、设备名、大小、用时和速度，不记录 Cookie 或请求 URL。
+
 ## 网页可视化删除
 
 网页的“文件管理”提供“全选可删除文件”和“删除所选（N）”，也可以点每个文件旁的“删除”。单个删除确认文件名，多选只确认一次；删除中转副本不会影响已经下载到设备上的文件。
@@ -97,6 +104,8 @@ Windows 免安装包为 `lanfiles-win.zip`，解压后运行 `start.bat`；其 P
 | `POST /api/send?to=公开ID&name=文件名` | 私发原始文件字节，需要 Content-Length |
 | `POST /api/send?domain=1234&name=文件名` | 房间广播，与 to 二选一 |
 | `GET /api/download/传输ID` | 下载，浏览器链接自动带 Cookie |
+| `GET /api/admin/devices` | 本机管理：所有设备（含房间、IP、在线状态） |
+| `POST /api/admin/delete-device/设备ID` | 本机管理：删除设备 |
 | `POST /api/ack/传输ID` | 移除，`pending` 表示还在等待磁盘删除，重复操作待删除记录仍校验所有者并返回真实状态 |
 
 旧 `from`、`device_id` 查询参数如仍发送，必须与 Cookie 身份一致，否则 `403`；没有有效 Cookie 返回 `401`。浏览器跨站修改请求被拒绝，不开放 CORS。不支持 `Expect: 100-continue`，返回 `417`；直接发送带 Content-Length 的请求即可。

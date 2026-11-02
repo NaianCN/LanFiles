@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-局域网传文件（LanFiles）—— 桌面 App 客户端
-深度参考 iOS 设计语言（分组卡片、系统蓝、圆角胶囊与微交互）
-保证二维码在最小窗口状态下也 100% 完整清晰显示。
+局域网传文件（LanFiles）—— 桌面 App：启动服务、显示连接地址与二维码、管理设备。
 """
 
 import argparse
@@ -17,6 +15,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.request
 import webbrowser
 from typing import List, Tuple
 
@@ -184,6 +183,14 @@ def get_lan_ips() -> Tuple[str, List[str]]:
     return primary, others
 
 
+def short_path(path: str, limit: int = 42) -> str:
+    """界面显示用：用户目录写成 ~，过长时只保留末尾。"""
+    home = os.path.expanduser("~")
+    if home and home != "~" and (path == home or path.startswith(home + os.sep)):
+        path = "~" + path[len(home):]
+    return path if len(path) <= limit else "…" + path[-(limit - 1):]
+
+
 def resolve_spool_dir(desired=None) -> str:
     """自动探测并返回首个实际可写的中转目录。"""
     if desired:
@@ -222,9 +229,8 @@ class LanFilesApp:
     def __init__(self, root: tk.Tk, limits=None):
         self.root = root
         self.limits = limits or Limits()
-        self.root.title("局域网传文件 · LanFiles")
-        # 宽裕的默认尺寸，并设置 560x520 紧凑最小尺寸（即便缩至最小，二维码也绝对完整显示）
-        self.root.geometry("740x670")
+        self.root.title("局域网传文件")
+        self.root.geometry("680x680")
         self.root.minsize(560, 520)
         self.root.configure(bg=COLOR_BG)
 
@@ -236,7 +242,13 @@ class LanFilesApp:
         self.qr_image = None
         self.log_queue = queue.Queue()
         self._is_closing = False
-        self.logs_expanded = True
+        self.logs_expanded = False
+        self.devices_expanded = True
+        self.devices = None          # None = 尚未取得；[] = 没有设备
+        self._devices_signature = None
+        self._device_fetching = False
+        # 本机管理接口走回环地址，绕过系统代理。
+        self._http = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 
         # 定位 transfer.py
         self.transfer_script = self._find_transfer_script()
@@ -247,6 +259,7 @@ class LanFilesApp:
         # 启动后台服务
         self.start_server()
         self.root.after(100, self._process_log_queue)
+        self.root.after(800, self._poll_devices)
 
         # 快捷键与退出处理
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
@@ -264,468 +277,318 @@ class LanFilesApp:
                 return os.path.abspath(p)
         return "transfer.py"
 
+    # ------------------------------------------------------------------
+    # 界面
+    # ------------------------------------------------------------------
+    def _card(self, parent, **kwargs):
+        options = dict(bg=COLOR_CARD, highlightbackground=COLOR_BORDER, highlightthickness=1, padx=14, pady=12)
+        options.update(kwargs)
+        return tk.Frame(parent, **options)
+
+    def _section_title(self, parent, text):
+        return tk.Label(parent, text=text, font=(FONT_FAMILY, 12, "bold"), bg=COLOR_BG, fg=COLOR_HEADER)
+
+    def _gray_button(self, parent, text, command, fg=COLOR_TEXT):
+        return IOSButton(parent, text=text, command=command, bg_color=COLOR_GRAY_BTN, fg_color=fg,
+                         hover_bg=COLOR_GRAY_HOVER, font=(FONT_FAMILY, 11), padx=10, pady=4)
+
     def _build_ui(self):
-        self.main_container = tk.Frame(self.root, bg=COLOR_BG, padx=14, pady=12)
+        self.main_container = tk.Frame(self.root, bg=COLOR_BG, padx=16, pady=14)
         self.main_container.pack(fill=tk.BOTH, expand=True)
 
-        # ===================================================================
-        # 1. iOS 顶部导航大标题栏
-        # ===================================================================
+        # 1. 标题栏 ---------------------------------------------------------
         header = tk.Frame(self.main_container, bg=COLOR_BG)
-        header.pack(fill=tk.X, pady=(0, 8))
+        header.pack(fill=tk.X, pady=(0, 12))
+        tk.Label(header, text="局域网传文件", font=(FONT_FAMILY, 20, "bold"),
+                 bg=COLOR_BG, fg=COLOR_TEXT).pack(side=tk.LEFT)
 
-        title_left = tk.Frame(header, bg=COLOR_BG)
-        title_left.pack(side=tk.LEFT, fill=tk.Y)
-
-        title_lbl = tk.Label(
-            title_left,
-            text="局域网传文件",
-            font=(FONT_FAMILY, 22, "bold"),
-            bg=COLOR_BG,
-            fg=COLOR_TEXT
-        )
-        title_lbl.pack(anchor="w")
-
-        subtitle_lbl = tk.Label(
-            title_left,
-            text=("同 Wi-Fi 浏览器互传 · 单文件 %.1f GiB · 总量 %.1f GiB · 并发 %d" % (
-                self.limits.max_file_size / 1024**3, self.limits.spool_quota / 1024**3, self.limits.max_uploads)),
-            font=(FONT_FAMILY, 12),
-            bg=COLOR_BG,
-            fg=COLOR_SECONDARY
-        )
-        subtitle_lbl.pack(anchor="w", pady=(1, 0))
-
-        # 状态指示胶囊
-        self.status_pill = tk.Frame(
-            header,
-            bg=COLOR_GREEN_BG,
-            highlightbackground=COLOR_GREEN,
-            highlightthickness=1,
-            padx=9,
-            pady=4
-        )
-        self.status_pill.pack(side=tk.RIGHT, pady=2)
-
-        self.status_dot = tk.Label(
-            self.status_pill,
-            text="●",
-            fg=COLOR_GREEN,
-            bg=COLOR_GREEN_BG,
-            font=("Arial", 11)
-        )
+        self.status_pill = tk.Frame(header, bg=COLOR_GREEN_BG, padx=10, pady=3)
+        self.status_pill.pack(side=tk.RIGHT)
+        self.status_dot = tk.Label(self.status_pill, text="●", fg=COLOR_GREEN, bg=COLOR_GREEN_BG, font=("Arial", 10))
         self.status_dot.pack(side=tk.LEFT, padx=(0, 4))
-
-        self.status_text = tk.Label(
-            self.status_pill,
-            text=f"服务运行中 : {self.server_port}",
-            fg=COLOR_GREEN,
-            bg=COLOR_GREEN_BG,
-            font=(FONT_FAMILY, 11, "bold")
-        )
+        self.status_text = tk.Label(self.status_pill, text="", fg=COLOR_GREEN, bg=COLOR_GREEN_BG,
+                                    font=(FONT_FAMILY, 11, "bold"))
         self.status_text.pack(side=tk.LEFT)
 
-        # ===================================================================
-        # 2. Section 1: 连接地址与二维码卡片（核心展示）
-        # ===================================================================
-        tk.Label(
-            self.main_container,
-            text="连接地址 · 手机扫码或浏览器访问",
-            font=(FONT_FAMILY, 12, "bold"),
-            bg=COLOR_BG,
-            fg=COLOR_HEADER
-        ).pack(anchor="w", pady=(2, 6))
+        # 2. 连接地址 -------------------------------------------------------
+        card1 = self._card(self.main_container)
+        card1.pack(fill=tk.X, pady=(0, 12))
 
-        card1 = tk.Frame(
-            self.main_container,
-            bg=COLOR_CARD,
-            highlightbackground=COLOR_BORDER,
-            highlightthickness=1,
-            padx=14,
-            pady=12
-        )
-        card1.pack(fill=tk.X, pady=(0, 10))
-
-        # --- 二维码容器：布局在左侧，永久保证 100% 完整显示，无论窗口缩小到什么程度都绝不被遮挡 ---
-        self.qr_container = tk.Frame(
-            card1,
-            bg="#FAFAFA",
-            highlightbackground=COLOR_BORDER,
-            highlightthickness=1,
-            padx=10,
-            pady=8
-        )
-        self.qr_container.pack(side=tk.LEFT, anchor="center", padx=(0, 14), fill=tk.NONE, expand=False)
-
+        self.qr_container = tk.Frame(card1, bg="#FFFFFF")
+        self.qr_container.pack(side=tk.LEFT, anchor="center", padx=(0, 16))
         self.qr_label = tk.Label(self.qr_container, bg="#FFFFFF")
         self.qr_label.pack()
 
-        tk.Label(
-            self.qr_container,
-            text="📷 手机扫码直达",
-            font=(FONT_FAMILY, 10),
-            bg="#FAFAFA",
-            fg=COLOR_SECONDARY
-        ).pack(pady=(4, 0))
-
-        # --- 右侧：网址卡片与操作按钮 ---
         right_body = tk.Frame(card1, bg=COLOR_CARD)
         right_body.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
 
-        # 网址高亮条（iOS 柔和蓝底框）
-        self.url_box = tk.Frame(
-            right_body,
-            bg=COLOR_BLUE_BG,
-            highlightbackground=COLOR_BLUE,
-            highlightthickness=1.5,
-            padx=10,
-            pady=8
-        )
-        self.url_box.pack(fill=tk.X, pady=(0, 8))
-
         self.url_var = tk.StringVar(value=f"http://{self.primary_ip}:{self.server_port}")
-        self.url_display = tk.Label(
-            self.url_box,
-            textvariable=self.url_var,
-            font=(MONO_FAMILY, 17, "bold"),
-            fg="#0051C7",
-            bg=COLOR_BLUE_BG,
-            cursor="hand2"
-        )
-        self.url_display.pack(anchor="w")
+        self.url_display = tk.Label(right_body, textvariable=self.url_var, font=(MONO_FAMILY, 18, "bold"),
+                                    fg=COLOR_BLUE, bg=COLOR_CARD, cursor="hand2", anchor="w")
+        self.url_display.pack(fill=tk.X, pady=(2, 10))
         self.url_display.bind("<Button-1>", lambda e: self.copy_url())
 
-        # 按钮栏（iOS 胶囊按钮）
         btn_bar = tk.Frame(right_body, bg=COLOR_CARD)
-        btn_bar.pack(fill=tk.X, pady=(0, 6))
-
-        self.copy_btn = IOSButton(
-            btn_bar,
-            text="📋 复制网址",
-            command=self.copy_url,
-            bg_color=COLOR_BLUE,
-            fg_color="#FFFFFF",
-            hover_bg=COLOR_BLUE_HOVER,
-            active_bg=COLOR_BLUE_ACTIVE,
-            padx=11,
-            pady=5
-        )
+        btn_bar.pack(fill=tk.X)
+        self.copy_btn = IOSButton(btn_bar, text="复制", command=self.copy_url, padx=14, pady=4)
         self.copy_btn.pack(side=tk.LEFT, padx=(0, 6))
-
-        self.open_browser_btn = IOSButton(
-            btn_bar,
-            text="🌐 浏览器打开",
-            command=self.open_in_browser,
-            bg_color=COLOR_GRAY_BTN,
-            fg_color=COLOR_BLUE,
-            hover_bg=COLOR_GRAY_HOVER,
-            padx=11,
-            pady=5
-        )
+        self.open_browser_btn = self._gray_button(btn_bar, "打开", self.open_in_browser, fg=COLOR_BLUE)
         self.open_browser_btn.pack(side=tk.LEFT, padx=(0, 6))
-
-        self.refresh_ip_btn = IOSButton(
-            btn_bar,
-            text="🔄 刷新",
-            command=self.refresh_ips,
-            bg_color=COLOR_GRAY_BTN,
-            fg_color=COLOR_TEXT,
-            hover_bg=COLOR_GRAY_HOVER,
-            padx=9,
-            pady=5
-        )
+        self.refresh_ip_btn = self._gray_button(btn_bar, "刷新", self.refresh_ips)
         self.refresh_ip_btn.pack(side=tk.LEFT)
 
-        # 备用地址栏
         self.other_frame = tk.Frame(right_body, bg=COLOR_CARD)
-        self.other_frame.pack(fill=tk.X, pady=(2, 0))
+        self.other_frame.pack(fill=tk.X, pady=(10, 0))
         self._render_other_ips()
 
-        # 提示小字
-        tk.Label(
-            right_body,
-            text="💡 手机连入同一 Wi-Fi 后，用相机扫码或浏览器打开",
-            font=(FONT_FAMILY, 11),
-            bg=COLOR_CARD,
-            fg=COLOR_SECONDARY
-        ).pack(anchor="w", pady=(4, 0))
+        # 3. 设备（可折叠） -------------------------------------------------
+        dev_header = tk.Frame(self.main_container, bg=COLOR_BG, cursor="hand2")
+        dev_header.pack(fill=tk.X, pady=(0, 6))
+        self.devices_title = self._section_title(dev_header, "▾ 设备")
+        self.devices_title.configure(cursor="hand2")
+        self.devices_title.pack(side=tk.LEFT)
+        self.devices_count = tk.Label(dev_header, text="", font=(FONT_FAMILY, 11), bg=COLOR_BG, fg=COLOR_SECONDARY)
+        self.devices_count.pack(side=tk.RIGHT)
+        for widget in (dev_header, self.devices_title, self.devices_count):
+            widget.bind("<Button-1>", lambda e: self.toggle_devices())
 
-        # ===================================================================
-        # 3. Section 2: 服务设置与中转目录（iOS TableView 风格卡片）
-        # ===================================================================
-        tk.Label(
-            self.main_container,
-            text="服务设置与中转目录",
-            font=(FONT_FAMILY, 12, "bold"),
-            bg=COLOR_BG,
-            fg=COLOR_HEADER
-        ).pack(anchor="w", pady=(2, 6))
+        self.devices_card = self._card(self.main_container, padx=0, pady=0)
+        self.devices_card.pack(fill=tk.X, pady=(0, 12))
+        self.devices_canvas = tk.Canvas(self.devices_card, bg=COLOR_CARD, highlightthickness=0, height=44)
+        self.devices_scroll = tk.Scrollbar(self.devices_card, command=self.devices_canvas.yview)
+        self.devices_canvas.configure(yscrollcommand=self.devices_scroll.set)
+        self.devices_canvas.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.devices_inner = tk.Frame(self.devices_canvas, bg=COLOR_CARD)
+        self._devices_window = self.devices_canvas.create_window((0, 0), window=self.devices_inner, anchor="nw")
+        self.devices_canvas.bind("<Configure>", lambda e: self.devices_canvas.itemconfigure(self._devices_window, width=e.width))
+        self.devices_inner.bind("<Configure>", lambda e: self.devices_canvas.configure(scrollregion=self.devices_canvas.bbox("all")))
+        self.devices_canvas.bind("<Enter>", lambda e: self.devices_canvas.bind_all("<MouseWheel>", self._on_devices_wheel))
+        self.devices_canvas.bind("<Leave>", lambda e: self.devices_canvas.unbind_all("<MouseWheel>"))
+        self._render_devices()
 
-        card2 = tk.Frame(
-            self.main_container,
-            bg=COLOR_CARD,
-            highlightbackground=COLOR_BORDER,
-            highlightthickness=1,
-            padx=14,
-            pady=8
-        )
-        card2.pack(fill=tk.X, pady=(0, 10))
+        # 4. 设置 -----------------------------------------------------------
+        self._section_title(self.main_container, "设置").pack(anchor="w", pady=(0, 6))
+        card2 = self._card(self.main_container, pady=8)
+        card2.pack(fill=tk.X, pady=(0, 12))
 
-        # Row 1: 端口配置与启停
         row1 = tk.Frame(card2, bg=COLOR_CARD)
         row1.pack(fill=tk.X, pady=4)
-
-        tk.Label(
-            row1,
-            text="监听端口：",
-            font=(FONT_FAMILY, 12),
-            bg=COLOR_CARD,
-            fg=COLOR_TEXT
-        ).pack(side=tk.LEFT)
-
+        tk.Label(row1, text="端口", width=4, anchor="w", font=(FONT_FAMILY, 12), bg=COLOR_CARD, fg=COLOR_TEXT).pack(side=tk.LEFT)
         self.port_var = tk.StringVar(value=str(self.server_port))
-        self.port_entry = tk.Entry(
-            row1,
-            textvariable=self.port_var,
-            width=6,
-            font=(FONT_FAMILY, 12),
-            highlightbackground=COLOR_BORDER,
-            relief="solid",
-            bd=1
-        )
-        self.port_entry.pack(side=tk.LEFT, padx=(2, 8))
+        self.port_entry = tk.Entry(row1, textvariable=self.port_var, width=6, font=(MONO_FAMILY, 12),
+                                   relief="flat", bg=COLOR_BG, highlightthickness=1,
+                                   highlightbackground=COLOR_BORDER, highlightcolor=COLOR_BLUE)
+        self.port_entry.pack(side=tk.LEFT, padx=(4, 8), ipady=3)
+        self.port_entry.bind("<Return>", lambda e: self.change_port_and_restart())
+        self.restart_btn = self._gray_button(row1, "应用", self.change_port_and_restart)
+        self.restart_btn.pack(side=tk.LEFT)
+        self.toggle_btn = IOSButton(row1, text="停止服务", command=self.toggle_server, bg_color=COLOR_RED,
+                                    hover_bg=COLOR_RED_HOVER, active_bg=COLOR_RED_HOVER,
+                                    font=(FONT_FAMILY, 11, "bold"), padx=10, pady=4)
+        self.toggle_btn.pack(side=tk.RIGHT)
 
-        self.restart_btn = IOSButton(
-            row1,
-            text="更改并重启",
-            command=self.change_port_and_restart,
-            bg_color=COLOR_GRAY_BTN,
-            fg_color=COLOR_TEXT,
-            hover_bg=COLOR_GRAY_HOVER,
-            padx=8,
-            pady=3,
-            font=(FONT_FAMILY, 11)
-        )
-        self.restart_btn.pack(side=tk.LEFT, padx=(0, 8))
+        tk.Frame(card2, height=1, bg=COLOR_BORDER).pack(fill=tk.X, pady=6)
 
-        self.toggle_btn = IOSButton(
-            row1,
-            text="⏹ 停止服务",
-            command=self.toggle_server,
-            bg_color=COLOR_RED,
-            fg_color="#FFFFFF",
-            hover_bg=COLOR_RED_HOVER,
-            padx=9,
-            pady=3,
-            font=(FONT_FAMILY, 11, "bold")
-        )
-        self.toggle_btn.pack(side=tk.LEFT)
-
-        # 分割线（iOS 行间分割线）
-        tk.Frame(card2, height=1, bg=COLOR_BORDER).pack(fill=tk.X, pady=5)
-
-        # Row 2: 中转文件存放目录
         row2 = tk.Frame(card2, bg=COLOR_CARD)
         row2.pack(fill=tk.X, pady=4)
+        tk.Label(row2, text="目录", width=4, anchor="w", font=(FONT_FAMILY, 12), bg=COLOR_CARD, fg=COLOR_TEXT).pack(side=tk.LEFT)
+        self.spool_var = tk.StringVar(value=short_path(self.spool_dir))
+        self.change_spool_btn = self._gray_button(row2, "更换", self.change_spool_directory)
+        self.change_spool_btn.pack(side=tk.RIGHT)
+        self.open_spool_btn = self._gray_button(row2, "打开", self.open_spool_directory, fg=COLOR_BLUE)
+        self.open_spool_btn.pack(side=tk.RIGHT, padx=(0, 6))
+        tk.Label(row2, textvariable=self.spool_var, font=(MONO_FAMILY, 11), bg=COLOR_CARD, fg=COLOR_SECONDARY,
+                 anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(4, 8))
 
-        tk.Label(
-            row2,
-            text="文件存放：",
-            font=(FONT_FAMILY, 12),
-            bg=COLOR_CARD,
-            fg=COLOR_TEXT
-        ).pack(side=tk.LEFT)
-
-        self.spool_var = tk.StringVar(value=self.spool_dir)
-        spool_entry = tk.Entry(
-            row2,
-            textvariable=self.spool_var,
-            font=(MONO_FAMILY, 11),
-            fg=COLOR_SECONDARY,
-            state="readonly",
-            highlightbackground=COLOR_BORDER,
-            relief="solid",
-            bd=1
-        )
-        spool_entry.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=(2, 8))
-
-        self.open_spool_btn = IOSButton(
-            row2,
-            text="📂 访达中打开",
-            command=self.open_spool_directory,
-            bg_color=COLOR_BLUE,
-            fg_color="#FFFFFF",
-            hover_bg=COLOR_BLUE_HOVER,
-            padx=9,
-            pady=3,
-            font=(FONT_FAMILY, 11, "bold")
-        )
-        self.open_spool_btn.pack(side=tk.LEFT, padx=(0, 6))
-
-        self.change_spool_btn = IOSButton(
-            row2,
-            text="更换...",
-            command=self.change_spool_directory,
-            bg_color=COLOR_GRAY_BTN,
-            fg_color=COLOR_TEXT,
-            hover_bg=COLOR_GRAY_HOVER,
-            padx=8,
-            pady=3,
-            font=(FONT_FAMILY, 11)
-        )
-        self.change_spool_btn.pack(side=tk.LEFT)
-
-        # ===================================================================
-        # 4. Section 3: 运行日志（可折叠式 iOS 卡片）
-        # ===================================================================
+        # 5. 日志（默认折叠） -----------------------------------------------
         log_header = tk.Frame(self.main_container, bg=COLOR_BG)
-        log_header.pack(fill=tk.X, pady=(2, 4))
-
-        self.log_title_lbl = tk.Label(
-            log_header,
-            text="▼ 运行日志与传输动态",
-            font=(FONT_FAMILY, 12, "bold"),
-            bg=COLOR_BG,
-            fg=COLOR_HEADER,
-            cursor="hand2"
-        )
+        log_header.pack(fill=tk.X, pady=(0, 6))
+        self.log_title_lbl = self._section_title(log_header, "▸ 日志")
+        self.log_title_lbl.configure(cursor="hand2")
         self.log_title_lbl.pack(side=tk.LEFT)
         self.log_title_lbl.bind("<Button-1>", lambda e: self.toggle_logs())
+        self.clear_log_btn = tk.Label(log_header, text="清空", font=(FONT_FAMILY, 11), bg=COLOR_BG,
+                                      fg=COLOR_SECONDARY, cursor="hand2")
+        self.clear_log_btn.bind("<Button-1>", lambda e: self.clear_logs())
 
-        IOSButton(
-            log_header,
-            text="清空日志",
-            command=self.clear_logs,
-            bg_color=COLOR_GRAY_BTN,
-            fg_color=COLOR_SECONDARY,
-            hover_bg=COLOR_GRAY_HOVER,
-            padx=6,
-            pady=2,
-            font=(FONT_FAMILY, 10)
-        ).pack(side=tk.RIGHT)
-
-        self.card3 = tk.Frame(
-            self.main_container,
-            bg="#1E1E1E",
-            highlightbackground=COLOR_BORDER,
-            highlightthickness=1
-        )
-        self.card3.pack(fill=tk.BOTH, expand=True)
-
-        self.log_text = tk.Text(
-            self.card3,
-            bg="#1E1E1E",
-            fg="#D4D4D4",
-            insertbackground="#FFFFFF",
-            font=(MONO_FAMILY, 11),
-            relief="flat",
-            wrap=tk.WORD,
-            padx=8,
-            pady=6
-        )
+        self.card3 = tk.Frame(self.main_container, bg="#1E1E1E")
+        self.log_text = tk.Text(self.card3, bg="#1E1E1E", fg="#D4D4D4", insertbackground="#FFFFFF",
+                                font=(MONO_FAMILY, 11), relief="flat", wrap=tk.WORD, padx=10, pady=8,
+                                highlightthickness=0)
         self.log_text.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
         scrollbar = tk.Scrollbar(self.card3, command=self.log_text.yview)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.config(yscrollcommand=scrollbar.set)
 
-        # 初始刷新二维码
         self._update_qr()
 
     def toggle_logs(self):
-        """折叠/展开运行日志面板。"""
+        """折叠/展开日志面板。"""
+        self.logs_expanded = not self.logs_expanded
         if self.logs_expanded:
-            self.card3.pack_forget()
-            self.log_title_lbl.configure(text="▶ 运行日志与传输动态 (点击展开)")
-            self.logs_expanded = False
-        else:
             self.card3.pack(fill=tk.BOTH, expand=True)
-            self.log_title_lbl.configure(text="▼ 运行日志与传输动态")
-            self.logs_expanded = True
+            self.clear_log_btn.pack(side=tk.RIGHT)
+            self.log_text.see(tk.END)
+        else:
+            self.card3.pack_forget()
+            self.clear_log_btn.pack_forget()
+        self.log_title_lbl.configure(text=("▾ 日志" if self.logs_expanded else "▸ 日志"))
+
+    def toggle_devices(self):
+        self.devices_expanded = not self.devices_expanded
+        if self.devices_expanded:
+            self.devices_card.pack(fill=tk.X, pady=(0, 12), after=self.devices_title.master)
+        else:
+            self.devices_card.pack_forget()
+        self._update_devices_title()
+
+    def _update_devices_title(self):
+        self.devices_title.configure(text=("▾ 设备" if self.devices_expanded else "▸ 设备"))
+        if self.devices:
+            online = sum(1 for d in self.devices if d["online"])
+            self.devices_count.configure(text="%d 台在线 · 共 %d 台" % (online, len(self.devices)))
+        else:
+            self.devices_count.configure(text="")
 
     def _render_other_ips(self):
         for child in self.other_frame.winfo_children():
             child.destroy()
-
         if not self.other_ips:
             return
-
-        tk.Label(
-            self.other_frame,
-            text="备用地址：",
-            font=(FONT_FAMILY, 10, "bold"),
-            bg=COLOR_CARD,
-            fg=COLOR_SECONDARY
-        ).pack(side=tk.LEFT)
-
+        tk.Label(self.other_frame, text="备用", font=(FONT_FAMILY, 10), bg=COLOR_CARD,
+                 fg=COLOR_SECONDARY).pack(side=tk.LEFT, padx=(0, 6))
         for ip in self.other_ips:
             alt_url = f"http://{ip}:{self.server_port}"
-            tk.Label(
-                self.other_frame,
-                text=alt_url,
-                font=(MONO_FAMILY, 10),
-                bg=COLOR_CARD,
-                fg=COLOR_TEXT
-            ).pack(side=tk.LEFT, padx=(2, 4))
+            link = tk.Label(self.other_frame, text=alt_url, font=(MONO_FAMILY, 11), bg=COLOR_CARD,
+                            fg=COLOR_TEXT, cursor="hand2")
+            link.pack(side=tk.LEFT, padx=(0, 10))
+            link.bind("<Button-1>", lambda e, u=alt_url, w=link: self._copy_feedback(w, u))
 
-            IOSButton(
-                self.other_frame,
-                text="复制",
-                command=lambda u=alt_url: self.copy_text(u),
-                bg_color=COLOR_GRAY_BTN,
-                fg_color=COLOR_TEXT,
-                hover_bg=COLOR_GRAY_HOVER,
-                padx=5,
-                pady=1,
-                font=(FONT_FAMILY, 9)
-            ).pack(side=tk.LEFT, padx=(0, 6))
+    # ------------------------------------------------------------------
+    # 设备列表：通过本机管理接口读取与删除
+    # ------------------------------------------------------------------
+    def _admin_request(self, method, path):
+        url = "http://127.0.0.1:%d%s" % (self.server_port, path)
+        req = urllib.request.Request(url, data=b"" if method == "POST" else None, method=method)
+        with self._http.open(req, timeout=3) as resp:
+            return json.loads(resp.read().decode("utf-8"))
 
+    def _poll_devices(self):
+        if self._is_closing:
+            return
+        if not self.is_server_running():
+            self._set_devices(None)
+        else:
+            self._poll_devices_once()
+        self.root.after(2000, self._poll_devices)
+
+    def _set_devices(self, devices):
+        self.devices = devices
+        signature = None if devices is None else tuple(
+            (d["id"], d["name"], d["domain"], d["addr"], d["online"]) for d in devices)
+        if signature != self._devices_signature:
+            self._devices_signature = signature
+            self._render_devices()
+        self._update_devices_title()
+
+    def _render_devices(self):
+        for child in self.devices_inner.winfo_children():
+            child.destroy()
+        rows = sorted(self.devices or [], key=lambda d: (not d["online"], d["name"]))
+        if not rows:
+            text = "暂无设备" if self.devices is not None else ("连接中…" if self.is_server_running() else "服务未运行")
+            tk.Label(self.devices_inner, text=text, font=(FONT_FAMILY, 11), bg=COLOR_CARD,
+                     fg=COLOR_SECONDARY, pady=12).pack(fill=tk.X)
+        for index, dev in enumerate(rows):
+            if index:
+                tk.Frame(self.devices_inner, height=1, bg=COLOR_BORDER).pack(fill=tk.X, padx=(36, 0))
+            row = tk.Frame(self.devices_inner, bg=COLOR_CARD, padx=14, pady=7)
+            row.pack(fill=tk.X)
+            tk.Label(row, text="●", font=("Arial", 11), bg=COLOR_CARD,
+                     fg=COLOR_GREEN if dev["online"] else "#C7C7CC").pack(side=tk.LEFT, padx=(0, 8))
+            delete = tk.Label(row, text="删除", font=(FONT_FAMILY, 11), bg=COLOR_CARD, fg=COLOR_RED, cursor="hand2")
+            delete.pack(side=tk.RIGHT)
+            delete.bind("<Button-1>", lambda e, d=dev: self.delete_device(d))
+            meta = "%s · %s" % ("房间 #" + dev["domain"] if dev["domain"] else "未加入房间", dev["addr"])
+            tk.Label(row, text=meta, font=(FONT_FAMILY, 10), bg=COLOR_CARD,
+                     fg=COLOR_SECONDARY).pack(side=tk.RIGHT, padx=(0, 14))
+            tk.Label(row, text=dev["name"], font=(FONT_FAMILY, 12, "bold" if dev["online"] else "normal"),
+                     bg=COLOR_CARD, fg=COLOR_TEXT if dev["online"] else COLOR_SECONDARY,
+                     anchor="w").pack(side=tk.LEFT, fill=tk.X, expand=True)
+        # 最多显示 5 行，更多时出现滚动条。
+        self.devices_inner.update_idletasks()
+        visible = max(1, min(len(rows), 5))
+        row_height = self.devices_inner.winfo_reqheight() / max(1, len(rows)) if rows else self.devices_inner.winfo_reqheight()
+        self.devices_canvas.configure(height=int(row_height * visible))
+        if len(rows) > 5:
+            self.devices_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+        else:
+            self.devices_scroll.pack_forget()
+            self.devices_canvas.yview_moveto(0)
+
+    def _on_devices_wheel(self, event):
+        if self.devices and len(self.devices) > 5:
+            self.devices_canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+
+    def delete_device(self, dev):
+        message = "删除设备“%s”？\n发给它的未下载私发文件也会删除。" % dev["name"]
+        if dev["online"]:
+            message += "\n该设备在线，删除后会以新身份重新连接。"
+        if not messagebox.askyesno("删除设备", message, icon="warning"):
+            return
+
+        def run():
+            try:
+                self._admin_request("POST", "/api/admin/delete-device/" + dev["id"])
+                self.log_queue.put("[App] 已删除设备 %s\n" % dev["name"])
+            except Exception as exc:
+                self.log_queue.put("[App 错误] 删除设备失败：%s\n" % exc)
+            self.log_queue.put(("refresh", None))
+        threading.Thread(target=run, daemon=True).start()
+
+    # ------------------------------------------------------------------
+    # 地址与目录
+    # ------------------------------------------------------------------
     def _update_qr(self):
         current_url = self.url_var.get()
         if not current_url or not generate_qr_photo:
             return
-
         try:
-            # 使用 130px 高清二维码，紧凑锐利，在最小窗口也 100% 完整显示
-            img = generate_qr_photo(self.root, current_url, target_size=130)
+            img = generate_qr_photo(self.root, current_url, target_size=132)
             if img:
                 self.qr_image = img
                 self.qr_label.configure(image=self.qr_image, width=img.width(), height=img.height())
         except Exception as e:
             self._log(f"[App] 二维码生成异常: {e}\n")
 
-    def copy_url(self):
-        url = self.url_var.get()
-        self.copy_text(url)
+    def _copy_feedback(self, widget, text):
+        self.copy_text(text)
+        original = widget.cget("text")
+        widget.configure(text="已复制 ✓")
+        self.root.after(1500, lambda: (not self._is_closing) and widget.configure(text=original))
 
-        orig_text = "📋 复制网址"
-        self.copy_btn.configure(text="✓ 已复制！", bg=COLOR_GREEN)
+    def copy_url(self):
+        self.copy_text(self.url_var.get())
+        self.copy_btn.configure(text="已复制 ✓", bg=COLOR_GREEN)
 
         def _restore():
             if not self._is_closing:
-                self.copy_btn.configure(text=orig_text, bg=COLOR_BLUE)
-
-        self.root.after(1800, _restore)
+                self.copy_btn.configure(text="复制", bg=COLOR_BLUE)
+        self.root.after(1500, _restore)
 
     def copy_text(self, text: str):
         self.root.clipboard_clear()
         self.root.clipboard_append(text)
         self.root.update()
-        self._log(f"[App] 已复制到剪贴板: {text}\n")
 
     def open_in_browser(self):
-        url = self.url_var.get()
-        self._log(f"[App] 打开浏览器: {url}\n")
-        webbrowser.open(url)
+        webbrowser.open(self.url_var.get())
 
     def refresh_ips(self):
-        self._log("[App] 正在重新扫描局域网 IP...\n")
         self.primary_ip, self.other_ips = get_lan_ips()
-        new_url = f"http://{self.primary_ip}:{self.server_port}"
-        self.url_var.set(new_url)
+        self.url_var.set(f"http://{self.primary_ip}:{self.server_port}")
         self._render_other_ips()
         self._update_qr()
-        self._log(f"[App] IP 扫描完成，主地址: {new_url}\n")
 
     def open_spool_directory(self):
         target = self.spool_dir
@@ -738,29 +601,28 @@ class LanFilesApp:
             subprocess.Popen(["open", target])
         else:
             webbrowser.open("file://" + target)
-        self._log(f"[App] 在访达中打开目录: {target}\n")
 
     def change_spool_directory(self):
-        new_dir = filedialog.askdirectory(initialdir=self.spool_dir, title="选择接收文件存放目录")
+        new_dir = filedialog.askdirectory(initialdir=self.spool_dir, title="选择中转目录")
         if new_dir:
             probe_dir = resolve_spool_dir(new_dir)
             if probe_dir == os.path.abspath(new_dir):
                 self.spool_dir = probe_dir
-                self.spool_var.set(probe_dir)
-                self._log(f"[App] 中转目录已更新为: {probe_dir}\n")
+                self.spool_var.set(short_path(probe_dir))
+                self._log(f"[App] 中转目录：{probe_dir}\n")
                 if self.is_server_running():
                     self.restart_server()
             else:
-                messagebox.showwarning("无写入权限", f"选取的目录不可写或无权限访问，已保持原目录：\n{self.spool_dir}")
+                messagebox.showwarning("无写入权限", f"该目录不可写，已保持原目录：\n{self.spool_dir}")
 
     def change_port_and_restart(self):
         val = self.port_var.get().strip()
         if not val.isdigit() or not (1024 <= int(val) <= 65535):
-            messagebox.showerror("端口无效", "请输入有效的端口号（1024 ~ 65535 之间）")
+            messagebox.showerror("端口无效", "请输入 1024 ~ 65535 之间的端口号")
             return
         new_port = int(val)
         if not check_port_available(new_port) and new_port != self.server_port:
-            messagebox.showwarning("端口已被占用", f"端口 {new_port} 已被占用，请尝试其他端口。")
+            messagebox.showwarning("端口已被占用", f"端口 {new_port} 已被占用，请换一个。")
             return
         self.server_port = new_port
         self.url_var.set(f"http://{self.primary_ip}:{self.server_port}")
@@ -768,6 +630,9 @@ class LanFilesApp:
         self._update_qr()
         self.restart_server()
 
+    # ------------------------------------------------------------------
+    # 服务进程
+    # ------------------------------------------------------------------
     def is_server_running(self) -> bool:
         return self.server_process is not None and self.server_process.poll() is None
 
@@ -789,9 +654,6 @@ class LanFilesApp:
             "--min-free-space", str(self.limits.min_free_space),
         ]
 
-        self._log(f"[App] 正在启动 LanFiles 服务...\n")
-        self._log(f"[App] 执行命令: {' '.join(cmd)}\n")
-
         try:
             self.server_process = subprocess.Popen(
                 cmd,
@@ -811,18 +673,18 @@ class LanFilesApp:
 
         time.sleep(0.3)
         if self.server_process.poll() is not None:
-            self._log(f"[App 错误] 服务启动后立即退出，请查看日志中的端口、目录锁或数据库错误。\n")
+            self._log("[App 错误] 服务启动失败，请展开日志查看端口、目录锁或数据库错误。\n")
             self._update_server_status_ui(False)
+            if not self.logs_expanded:
+                self.toggle_logs()
         else:
             self._update_server_status_ui(True)
-            self._log(f"[App 成功] 服务已在端口 {self.server_port} 成功运行。\n")
 
     def stop_server(self):
         if not self.server_process:
             self._update_server_status_ui(False)
             return
 
-        self._log("[App] 正在停止服务...\n")
         proc = self.server_process
         self.server_process = None
 
@@ -852,26 +714,17 @@ class LanFilesApp:
             self.start_server()
 
     def _update_server_status_ui(self, running: bool):
+        fg, bg = (COLOR_GREEN, COLOR_GREEN_BG) if running else (COLOR_RED, COLOR_RED_BG)
+        self.status_pill.configure(bg=bg)
+        self.status_dot.configure(fg=fg, bg=bg)
+        self.status_text.configure(text=("运行中 · %d" % self.server_port) if running else "已停止", fg=fg, bg=bg)
         if running:
-            self.status_pill.configure(bg=COLOR_GREEN_BG, highlightbackground=COLOR_GREEN)
-            self.status_dot.configure(text="●", fg=COLOR_GREEN, bg=COLOR_GREEN_BG)
-            self.status_text.configure(
-                text=f"服务运行中 : {self.server_port}",
-                fg=COLOR_GREEN,
-                bg=COLOR_GREEN_BG
-            )
             self.toggle_btn.set_theme(COLOR_RED, "#FFFFFF", COLOR_RED_HOVER)
-            self.toggle_btn.configure(text="⏹ 停止服务")
+            self.toggle_btn.configure(text="停止服务")
         else:
-            self.status_pill.configure(bg=COLOR_RED_BG, highlightbackground=COLOR_RED)
-            self.status_dot.configure(text="●", fg=COLOR_RED, bg=COLOR_RED_BG)
-            self.status_text.configure(
-                text="服务已停止",
-                fg=COLOR_RED,
-                bg=COLOR_RED_BG
-            )
             self.toggle_btn.set_theme(COLOR_GREEN, "#FFFFFF", "#2DB84D")
-            self.toggle_btn.configure(text="▶️ 启动服务")
+            self.toggle_btn.configure(text="启动服务")
+            self._set_devices(None)
 
     def _reader_thread(self):
         proc = self.server_process
@@ -891,16 +744,39 @@ class LanFilesApp:
     def _process_log_queue(self):
         while not self.log_queue.empty():
             try:
-                line = self.log_queue.get_nowait()
-                self._append_log_text(line)
+                item = self.log_queue.get_nowait()
             except queue.Empty:
                 break
+            if isinstance(item, tuple):
+                kind, payload = item
+                if kind == "devices":
+                    self._device_fetching = False
+                    if self.is_server_running() and payload is not None:
+                        self._set_devices(payload)
+                elif kind == "refresh":
+                    self._devices_signature = ()
+                    self._device_fetching = False
+                    self._poll_devices_once()
+            else:
+                self._append_log_text(item)
 
         if not self._is_closing:
             try:
                 self.root.after(150, self._process_log_queue)
             except Exception:
                 pass
+
+    def _poll_devices_once(self):
+        if self.is_server_running() and not self._device_fetching:
+            self._device_fetching = True
+
+            def fetch():
+                try:
+                    result = self._admin_request("GET", "/api/admin/devices")
+                except Exception:
+                    result = None
+                self.log_queue.put(("devices", result))
+            threading.Thread(target=fetch, daemon=True).start()
 
     def _log(self, msg: str):
         self._append_log_text(msg)

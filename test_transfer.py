@@ -100,6 +100,27 @@ class TestTransfer(unittest.TestCase):
         self.assertEqual(status,200)
         return json.loads(data)
 
+    def test_admin_lists_and_deletes_devices_only_from_host(self):
+        a,b=self.register(name="A",domain="1234"),self.register(name="B",domain="1234")
+        self.register(name="C",domain="5678")
+        _,_,data=self.send(a["device_id"],b["device_id"],"给B.txt",b"x")
+        tid=json.loads(data)["transfer_id"]
+        status,_,data=self.req("GET","/api/admin/devices")
+        self.assertEqual(status,200)
+        self.assertEqual({d["name"] for d in json.loads(data)},{"A","B","C"})
+        status,_,data=self.req("GET","/api/session?device_id="+a["device_id"])
+        self.assertTrue(json.loads(data)["admin"])
+        self.assertEqual(self.req("POST","/api/admin/delete-device/"+b["device_id"],headers={"Origin":"http://evil.example"})[0],403)
+        self.assertEqual(self.req("POST","/api/admin/delete-device/"+b["device_id"])[0],200)
+        self.assertEqual(self.req("GET","/api/session?device_id="+b["device_id"])[0],401)
+        self.assertFalse(os.path.exists(self.store.file_path(tid)))
+        self.assertEqual(self.req("POST","/api/admin/delete-device/"+b["device_id"])[0],404)
+        self.server.admin_addrs=set()
+        self.assertEqual(self.req("GET","/api/admin/devices")[0],403)
+        self.assertEqual(self.req("POST","/api/admin/delete-device/"+a["device_id"])[0],403)
+        status,_,data=self.req("GET","/api/session?device_id="+a["device_id"])
+        self.assertFalse(json.loads(data)["admin"])
+
     def test_visual_file_listing_permissions_and_room_exit(self):
         a,b,c=self.register(name="A",domain="1234"),self.register(name="B",domain="1234"),self.register(name="C",domain="1234")
         _,_,data=self.send(a["device_id"],b["device_id"],"私发.txt",b"direct")
