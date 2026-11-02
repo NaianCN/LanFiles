@@ -2,6 +2,7 @@
 
 - GPT
 - Gemini
+- Claude
 
 项目维护与发布：NaianCN。
 
